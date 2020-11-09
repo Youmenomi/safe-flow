@@ -1,0 +1,82 @@
+{
+  "name": "safe-flow",
+  "version": "0.0.0",
+  "description": "Simple and easy to safely cancel or interrupt the await-async flow.",
+  "keywords": [
+    "typescript",
+    "generator",
+    "safely",
+    "cancelable",
+    "interruptible",
+    "await-async",
+    "promise",
+    "flow"
+  ],
+  "main": "dist/cjs/safe-flow.cjs.js",
+  "module": "dist/esm/safe-flow.esm.js",
+  "types": "dist/types/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "jest",
+    "ts:check": "tsc --noEmit -p tsconfig.build.json",
+    "build:js": "rollup -c",
+    "build:types": "tsc --emitDeclarationOnly -p tsconfig.build.json",
+    "build:clean": "del dist",
+    "build": "npm run ts:check && eslint --ext .ts,.js ./src && npm run build:clean && npm run build:js && npm run build:types",
+    "release": "np",
+    "version": "npm run build"
+  },
+  "lint-staged": {
+    "*.{ts,js}": [
+      "prettier --write",
+      "eslint --fix",
+      "jest --bail --findRelatedTests"
+    ]
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Youmenomi/safe-flow.git"
+  },
+  "author": "Dean Yao <youmenomi@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Youmenomi/safe-flow/issues"
+  },
+  "homepage": "https://github.com/Youmenomi/safe-flow#readme",
+  "devDependencies": {
+    "@babel/plugin-proposal-class-properties": "^7.12.1",
+    "@babel/plugin-proposal-decorators": "^7.12.1",
+    "@babel/preset-env": "^7.12.1",
+    "@babel/preset-typescript": "^7.12.1",
+    "@types/jest": "^26.0.15",
+    "@typescript-eslint/eslint-plugin": "^4.6.1",
+    "@typescript-eslint/parser": "^4.6.1",
+    "babel-eslint": "^10.1.0",
+    "babel-jest": "^26.6.3",
+    "del-cli": "^3.0.1",
+    "eslint": "^7.12.1",
+    "eslint-config-prettier": "^6.15.0",
+    "eslint-plugin-prettier": "^3.1.4",
+    "husky": "^4.3.0",
+    "jest": "^26.6.3",
+    "lint-staged": "^10.5.1",
+    "mobx": "^6.0.3",
+    "np": "^7.0.0",
+    "prettier": "^2.1.2",
+    "rollup": "^2.33.1",
+    "rollup-simple-configer": "^0.1.1",
+    "ts-jest": "^26.4.3",
+    "typescript": "^4.0.5"
+  },
+  "dependencies": {
+    "custom-defaults": "^0.1.1",
+    "safe-catched": "^0.1.0"
+  }
+}
