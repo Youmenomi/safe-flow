@@ -12,7 +12,7 @@ export default [].concat(
       file: pkg.main,
       format: 'cjs',
     },
-    { external: ['custom-defaults', 'safe-catched'] }
+    { external: ['custom-defaults', 'catch-first'] }
   ),
   build(
     input,
@@ -20,7 +20,7 @@ export default [].concat(
       file: pkg.module,
       format: 'esm',
     },
-    { external: ['custom-defaults', 'safe-catched'] }
+    { external: ['custom-defaults', 'catch-first'] }
   ),
   build(
     input,

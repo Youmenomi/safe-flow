@@ -1,6 +1,6 @@
 import { defaults } from 'custom-defaults';
-import { safeCall, safeAwait, SafeCatched } from 'safe-catched';
-import { isGeneratorFunction, Dictionary, RequiredPick } from './helper';
+import { safeAwait, CatchFirst } from 'catch-first';
+import { Dictionary, RequiredPick } from './helper';
 
 export type FlowOptions = {
   token?: any;
@@ -14,34 +14,209 @@ export type FlowupOptions = {
   names?: { [key: string]: string | true };
 } & Config;
 
-export type FlowResult<T = any> = [Canceled] | [null, T];
+export type FlowResult<
+  TReturn = any,
+  TThis = any,
+  TParam extends any[] = any[],
+  TErrf extends boolean = false
+> = TErrf extends false
+  ? [Canceled<TReturn, TThis, TParam>] | [null, TReturn]
+  :
+      | [unknown]
+      | [null, Canceled<TReturn, TThis, TParam>]
+      | [null, null, TReturn];
 
-export type SafeFlowResult<T = any> =
-  | [unknown]
-  | [null, Canceled]
-  | [null, null, T];
+export type SafeFlowCreator<
+  TReturn = any,
+  TThis = any,
+  TParam extends any[] = any,
+  TErrf extends boolean = false
+> = (
+  ...args: TParam
+) => Promise<FlowResult<TReturn, TThis, TParam, TErrf>> &
+  (TErrf extends false
+    ? {
+        safe_flow_promise: true;
+        canceled: () => boolean;
+        cancel: (reason?: any) => void;
+        state: () => PromiseState;
+        errf: () => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, true>>;
+      }
+    : {
+        safe_flow_promise: true;
+        canceled: () => boolean;
+        cancel: (reason?: any) => void;
+        state: () => PromiseState;
+      });
 
-export type SafeFlowRun<
-  TReturn = FlowResult,
-  TParam extends Array<any> = any[]
-> = (this: any, ...args: TParam) => Promise<TReturn>;
+type Canceler = (reason: any, isThrow?: boolean, batching?: boolean) => any;
 
-type OnCancel = (reason: any) => any;
-type State = {
-  canceled: boolean;
-  token: any;
-  on: OnCancel[];
-};
+/* istanbul ignore next */
+function report() {
+  return new Error('[safe-flow] Please report this bug to the author.');
+}
 
-export class Canceled {
+const outOfControlMsg =
+  '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.';
+function outOfControl() {
+  return new Error(outOfControlMsg);
+}
+
+export enum FlowState {
+  canceled = 1,
+  done,
+}
+
+export enum ErrfState {
+  error = 1,
+  canceled,
+  done,
+}
+
+export enum PromiseState {
+  pending,
+  fulfilled,
+  rejected,
+  canceled,
+}
+class Thread {
+  promiseState: PromiseState = PromiseState.pending;
+  canceled = false;
+  state?: TraceState;
+  canceler?: Canceler;
+  cancellation?: Canceled;
+  children: Thread[] = [];
+
+  get hasChildren() {
+    return Boolean(this.children.length);
+  }
+
+  _disposed = false;
+  get disposed() {
+    return this._disposed;
+  }
+
+  _isPrint = false;
+  get isPrint() {
+    return this._isPrint;
+  }
+
   constructor(
-    public run: SafeFlowRun,
-    public thisArg: any,
-    public args: any,
+    public creator: SafeFlowCreator,
+    public token: any,
+    public trace: boolean | Trace,
+    public name?: string,
+    public id?: number
+  ) {
+    this._isPrint = Boolean(this.trace && this.name);
+    if (__debug_enable_value) __debug_live_threads.push(this);
+  }
+
+  changeState(state: TraceState.thread_start): void;
+  changeState(state: TraceState.thread_canceled, reason: unknown): void;
+  changeState(state: TraceState.thread_error, error: unknown): void;
+  changeState(state: TraceState.thread_completed, value: unknown): void;
+  changeState(
+    state: TraceState.thread_completed_canceled,
+    value: unknown
+  ): void;
+  changeState(state: TraceState.thread_terminated): void;
+  changeState(state: TraceState, ...args: any) {
+    this.state = state;
+    if (state === TraceState.thread_canceled) {
+      this.promiseState = PromiseState.canceled;
+    } else if (state === TraceState.thread_completed) {
+      this.promiseState = PromiseState.fulfilled;
+    } else if (state === TraceState.thread_error) {
+      this.promiseState = PromiseState.rejected;
+    }
+
+    if (this.trace && this.name) {
+      /* istanbul ignore else */
+      if (state === TraceState.thread_start) {
+        tracing(this.trace, { state, name: this.name, id: this.id });
+      } else if (state === TraceState.thread_canceled) {
+        tracing(this.trace, {
+          state,
+          name: this.name,
+          id: this.id,
+          reason: args[0],
+        });
+      } else if (state === TraceState.thread_error) {
+        tracing(this.trace, {
+          state,
+          name: this.name,
+          id: this.id,
+          error: args[0],
+        });
+      } else if (state === TraceState.thread_completed) {
+        tracing(this.trace, {
+          state,
+          name: this.name,
+          id: this.id,
+          value: args[0],
+        });
+      } else if (state === TraceState.thread_completed_canceled) {
+        tracing(this.trace, {
+          state,
+          name: this.name,
+          id: this.id,
+          value: args[0],
+        });
+      } else if (state === TraceState.thread_terminated) {
+        tracing(this.trace, {
+          state,
+          name: this.name,
+          id: this.id,
+        });
+      } else {
+        throw report();
+      }
+    }
+  }
+
+  addChild(thread: Thread) {
+    this.children.push(thread);
+  }
+
+  removeChild(thread: Thread) {
+    this.children.splice(this.children.indexOf(thread), 1);
+  }
+
+  dispose() {
+    /* istanbul ignore next */
+    if (this.disposed) throw report();
+
+    this._disposed = true;
+    this.changeState(TraceState.thread_terminated);
+
+    //@ts-expect-error
+    this.creator = undefined;
+    this.token = undefined;
+    //@ts-expect-error
+    this.trace = undefined;
+    this.canceler = undefined;
+    this.cancellation = undefined;
+
+    this.children.length = 0;
+    //@ts-expect-error
+    this.children = undefined;
+
+    if (__debug_enable_value) {
+      __debug_live_threads.splice(__debug_live_threads.indexOf(this), 1);
+    }
+  }
+}
+
+export class Canceled<TReturn = any, TThis = any, TParam extends any[] = any> {
+  constructor(
+    public creator: SafeFlowCreator<TReturn, TThis, TParam>,
+    public thisArg: TThis,
+    public args: TParam,
     public reason: any
   ) {}
-  async retry() {
-    return this.run.apply(this.thisArg, this.args);
+  retry() {
+    return this.creator.apply(this.thisArg, this.args);
   }
 }
 
@@ -54,7 +229,7 @@ type Config = {
 const defConfig: Required<Config> = {
   trace: false,
   standalone: false,
-  filter: () => true,
+  filter: () => false,
 } as const;
 let config: Required<Config> = defConfig;
 export function configure(options?: Config) {
@@ -62,65 +237,103 @@ export function configure(options?: Config) {
   else config = defConfig;
 }
 
-const tokenMap = new Map<any, SafeFlowRun[]>();
-const runMap = new Map<SafeFlowRun, State>();
-let running: OnCancel | undefined;
+const tokenCreators = new Map<any, SafeFlowCreator[]>();
+const creatorProcesses = new Map<SafeFlowCreator, Thread[]>();
 
-export const __debug_tokenMap = tokenMap;
-export const __debug_runMap = runMap;
-export function __debug_get_running() {
-  return running;
+let currentThread: Thread | undefined;
+function setCurrThread(thread?: Thread) {
+  if (__debug_enable_value) {
+    if (!thread) {
+      logger.log('[safe-flow] Clear the current thread pointer.');
+    } else if (thread && thread.name) {
+      logger.log(
+        `[safe-flow] Change the current thread pointer to [${thread.name}].`
+      );
+    } else {
+      logger.log('[safe-flow] The current thread pointer has changed.');
+    }
+  }
+  currentThread = thread;
 }
-let __debug_id: string | undefined;
-export function __debug_set_id(id?: string) {
-  __debug_id = id;
+function getCurrThread() {
+  return currentThread;
 }
 
-export enum FlowState {
-  created,
-  start,
-  canceled,
-  error,
-  awaitStart,
-  awaitEnded,
-  completed,
+/* istanbul ignore next */
+const logger = {
+  log: (...args: any[]) => {
+    console.log(...args);
+  },
+};
+
+export const __debug_logger = logger;
+
+export const __debug_token_creators = tokenCreators;
+export const __debug_creator_processes = creatorProcesses;
+export const __debug_get_curr_thread = getCurrThread;
+export function __debug_clear_names() {
+  names = {};
+}
+export function __debug_clear_threads() {
+  tokenCreators.clear();
+  creatorProcesses.clear();
+  __debug_live_threads.forEach((thread) => {
+    thread.dispose();
+  });
+  __debug_live_threads.length = 0;
+  currentThread = undefined;
+}
+
+let __debug_enable_value = false;
+export function __debug_enable(value: boolean) {
+  __debug_enable_value = value;
+}
+export const __debug_live_threads: Thread[] = [];
+
+export enum TraceState {
+  creator_created,
+  thread_start,
+  thread_canceled,
+  thread_error,
+
+  thread_completed,
+  thread_completed_canceled,
+  thread_terminated,
 }
 
 export type TraceEvent =
   | {
       name: string;
-      state: FlowState.created;
+      state: TraceState.creator_created;
     }
   | {
       name: string;
-      id: string | null;
-      state: FlowState.canceled;
+      id?: number;
+      state: TraceState.thread_canceled;
       reason?: any;
     }
   | {
       name: string;
-      id: string | null;
-      state: FlowState.error;
+      id?: number;
+      state: TraceState.thread_error;
       error: unknown;
     }
   | {
       name: string;
-      id: string | null;
-      state: FlowState.awaitEnded;
-      canceled?: boolean;
-      error?: unknown;
-      return?: unknown;
+      id?: number;
+      state: TraceState.thread_completed;
+      value: unknown;
     }
   | {
       name: string;
-      id: string | null;
-      state: FlowState.completed;
-      return: unknown;
+      id?: number;
+      state: TraceState.thread_completed_canceled;
+      value?: unknown;
     }
   | {
       name: string;
-      id: string | null;
-      state: FlowState.start | FlowState.awaitStart;
+      id?: number;
+      state: TraceState.thread_start | TraceState.thread_terminated;
     };
 
 export type Trace = (event: TraceEvent) => void;
@@ -128,37 +341,35 @@ export type Trace = (event: TraceEvent) => void;
 const defTrace: Trace = (event) => {
   const { name, state } = event;
   let status = 'none';
-  if (event.state === FlowState.canceled) {
+  if (event.state === TraceState.thread_canceled) {
     status =
       'canceled' + (event.reason === undefined ? '' : ` ${event.reason}`);
-  } else if (event.state === FlowState.error) {
+  } else if (event.state === TraceState.thread_error) {
     status = 'error' + ` ${event.error}`;
-  } else if (event.state === FlowState.awaitEnded) {
-    status =
-      'await-ended' +
-      (event.return ? ` ${event.return}` : '') +
-      (event.canceled ? ' (canceled)' : event.error ? ' (error)' : '');
-  } else if (event.state === FlowState.completed) {
-    status = 'completed' + (event.return ? ` ${event.return}` : '');
+  } else if (event.state === TraceState.thread_completed) {
+    status = 'completed' + (event.value ? ` ${event.value}` : '');
+  } else if (event.state === TraceState.thread_completed_canceled) {
+    status = 'completed (canceled)' + (event.value ? ` ${event.value}` : '');
   } else {
     switch (state) {
-      case FlowState.created:
-        status = 'created';
-        break;
-      case FlowState.start:
+      case TraceState.thread_start:
         status = 'start';
         break;
-      case FlowState.awaitStart:
-        status = 'await-start';
+      case TraceState.thread_terminated:
+        status = 'terminated';
         break;
     }
   }
 
-  console.log(
-    `[safe-flow] [${name}]${
-      event.state === FlowState.created ? '' : event.id ? `(${event.id})` : ''
-    }: ` + status
-  );
+  if (event.state === TraceState.creator_created) {
+    status = ' Creator is created.';
+  } else {
+    /* istanbul ignore if */
+    if (!event.id) throw report();
+    status = `(${event.id})` + ': ' + status;
+  }
+
+  logger.log(`[safe-flow] [${name}]` + status);
 };
 
 function tracing(trace: true | Trace, event: TraceEvent) {
@@ -169,265 +380,313 @@ function tracing(trace: true | Trace, event: TraceEvent) {
   }
 }
 
-export function flow<
-  TReturn = any,
-  T extends (...args: any[]) => Generator = (
-    ...args: any[]
-  ) => Generator<unknown, TReturn, unknown>
->(
-  generatorFunc: T & ((...args: any) => Generator<any, TReturn, any>),
-  options?: FlowOptions
-): SafeFlowRun<FlowResult<TReturn>, Parameters<T>> {
-  if (!isGeneratorFunction(generatorFunc)) {
-    throw new Error(
-      '[safe-flow] The target method is not a GeneratorFunction.'
-    );
-  }
+const breakMsg =
+  '[safe-flow] Do not use try/catch and .catch() on threads. It causes the parent thread to not be interrupted as expected when cancelled. Use .errf() to receive exceptions instead.';
+function getBreakMsg() {
+  return breakMsg;
+}
 
+export function flow<TReturn = any, TParam extends any[] = any>(
+  func: (...args: TParam) => Promise<TReturn>,
+  options?: FlowOptions
+): SafeFlowCreator<TReturn, ThisParameterType<typeof func>, TParam> {
+  if (typeof func !== 'function') {
+    throw new ReferenceError('[safe-flow] The func is not a function.');
+  }
+  return internalFlow(func, options);
+}
+
+function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
+  func: (...args: TParam) => Promise<TReturn>,
+  options?: FlowOptions,
+  thisArg?: any
+): SafeFlowCreator<TReturn, ThisParameterType<typeof func>, TParam> {
   const opts = defaults(options, config);
   let { token } = opts;
   const { trace, name, standalone } = opts;
-  if (trace && name) tracing(trace, { name, state: FlowState.created });
+  if (trace && name) {
+    registerName(name);
+    tracing(trace, { name, state: TraceState.creator_created });
+  }
 
-  return async function safe_flow_run(this: any, ...args: any[]) {
-    const id = trace && !standalone && name ? uid() : null;
-    if (trace && name) tracing(trace, { name, id, state: FlowState.start });
+  return function safe_flow_creator(this: TThis, ...args: TParam) {
+    const parentThread = getCurrThread();
 
-    token === undefined && (token = this);
-    !tokenMap.has(token) && tokenMap.set(token, []);
-    //Expected warning. Through the above code, the following variable "runs" will get an array.
-    const runs = tokenMap.get(token)!;
-    if (!runs.includes(safe_flow_run)) {
-      runs.push(safe_flow_run);
-    } else if (standalone) {
-      const error = new Error(
-        '[safe-flow] Standalone mode only allows one flow to run alone.'
-      );
-      if (trace && name)
-        tracing(trace, { name, id, state: FlowState.error, error });
-      throw error;
+    const id = trace && !standalone && name ? takeNumber(name) : undefined;
+
+    token === undefined && (token = thisArg);
+    let creators = tokenCreators.get(token);
+    if (creators) {
+      if (!creators.includes(safe_flow_creator)) {
+        creators.push(safe_flow_creator);
+      } else if (standalone) {
+        throw new Error(
+          '[safe-flow] Standalone mode flow only allows one process to execute.'
+        );
+      }
+    } else {
+      creators = [];
+      creators.push(safe_flow_creator);
+      tokenCreators.set(token, creators);
     }
 
-    !runMap.has(safe_flow_run) &&
-      runMap.set(safe_flow_run, { canceled: false, token, on: [] });
-    //Expected warning. Through the above code, the following variable "state" will get the value anyway.
-    const state = runMap.get(safe_flow_run)!;
+    !creatorProcesses.has(safe_flow_creator) &&
+      creatorProcesses.set(safe_flow_creator, []);
+    const process = creatorProcesses.get(safe_flow_creator);
 
-    //The variable "onCanceled" is definitely used after being assigned.
-    let onCanceled!: OnCancel;
-    return await Promise.race<any>([
-      new Promise((resolve) => {
-        const cb: OnCancel = (reason) => {
-          if (trace && name)
-            tracing(trace, {
-              name,
-              id,
-              state: FlowState.canceled,
-              reason,
-            });
-          resolve([new Canceled(safe_flow_run, this, args, reason)]);
-        };
-        state.on.push(cb);
-        onCanceled = cb;
-      }),
-      (async () => {
-        const result = generatorFunc.apply(this, args);
-        running = onCanceled;
-        let [catched, next] = safeCall(result, result.next);
-        running = undefined;
-        if (state.canceled) return;
-        if (catched) {
-          if (trace && name)
-            tracing(trace, {
-              name,
-              id,
-              state: FlowState.error,
-              error: catched.error,
-            });
-          dropout(state, safe_flow_run, runs, onCanceled);
-          throw catched.error;
-        }
-        //Expected warning. When the variable "catched" does not exist, the variable "next" below must exist.
-        let { done, value } = next!;
-        while (!done) {
-          if (value instanceof Promise) {
-            if (trace && name)
-              tracing(trace, { name, id, state: FlowState.awaitStart });
-            [catched, value] = await safeAwait(value);
-            if (trace && name) {
-              if (state.canceled) {
-                tracing(trace, {
-                  name,
-                  id,
-                  state: FlowState.awaitEnded,
-                  canceled: state.canceled,
-                  return: value,
-                });
-              } else if (catched) {
-                tracing(trace, {
-                  name,
-                  id,
-                  state: FlowState.awaitEnded,
-                  error: catched.error,
-                });
-              } else {
-                tracing(trace, {
-                  name,
-                  id,
-                  state: FlowState.awaitEnded,
-                  return: value,
-                });
-              }
-            }
-            if (state.canceled) return;
-            if (catched) {
-              [catched, next] = safeCall(result, result.throw, catched.error);
-              if (catched) {
-                if (trace && name)
-                  tracing(trace, {
-                    name,
-                    id,
-                    state: FlowState.error,
-                    error: catched.error,
-                  });
-                dropout(state, safe_flow_run, runs, onCanceled);
-                throw catched.error;
-              }
-              //Expected warning. When the variable "catched" does not exist, the variable "next" below must exist.
-              value = next!.value;
-              if (next!.done) break;
-            }
-          }
-          running = onCanceled;
-          [catched, next] = safeCall(result, result.next, value);
-          running = undefined;
-          if (state.canceled) return;
-          if (catched) {
-            if (trace && name)
-              tracing(trace, {
-                name,
-                id,
-                state: FlowState.error,
-                error: catched.error,
-              });
-            dropout(state, safe_flow_run, runs, onCanceled);
-            throw catched.error;
-          }
-          //Expected warning. When the variable "catched" does not exist, the variable "next" below must exist.
-          done = next!.done;
-          value = next!.value;
+    /* istanbul ignore if */
+    if (!process) throw report();
+
+    const thread = new Thread(safe_flow_creator, token, trace, name, id);
+    process.push(thread);
+    thread.changeState(TraceState.thread_start);
+
+    const promise = new Promise((resolve, reject) => {
+      setCurrThread(thread);
+
+      thread.canceler = (reason, isThrow = false, batching = true) => {
+        const { children } = thread;
+        children.concat().forEach((child) => {
+          /* istanbul ignore else */
+          if (!child.canceled) internalCancelSelf(child, reason, true);
+          else throw report();
+        });
+        if (parentThread) {
+          parentThread.removeChild(thread);
         }
 
-        if (trace && name)
-          tracing(trace, {
-            name,
-            id,
-            state: FlowState.completed,
-            return: value,
-          });
-        dropout(state, safe_flow_run, runs, onCanceled);
-        return [null, value];
-      })(),
-    ]);
-  };
+        const { creator, token } = thread;
+        const process = creatorProcesses.get(creator);
+        const creators = tokenCreators.get(token);
+        /* istanbul ignore if */
+        if (!process || !creators) throw report();
+        if (!batching) dropout(thread, process, creator, creators);
+
+        const cancellation = new Canceled(
+          safe_flow_creator,
+          thisArg,
+          args,
+          reason
+        );
+        thread.cancellation = cancellation;
+        thread.canceled = true;
+        thread.changeState(TraceState.thread_canceled, reason);
+
+        if (!thread.isPrint) thread.dispose();
+        setCurrThread(parentThread);
+
+        if (isThrow) reject(getBreakMsg());
+        else resolve([cancellation]);
+      };
+
+      if (parentThread) parentThread.addChild(thread);
+      safeAwait(func(...args)).then((result) => {
+        if (thread.canceled) {
+          thread.changeState(TraceState.thread_completed_canceled, result[1]);
+          if (thread.isPrint) thread.dispose();
+          return;
+        } else if (parentThread) {
+          parentThread.removeChild(thread);
+        }
+
+        /* istanbul ignore if */
+        if (!creators) throw report();
+        /* istanbul ignore else */
+        if (result.length === CatchFirst.caught) {
+          const [caught] = result;
+          thread.changeState(TraceState.thread_error, caught);
+          dropout(thread, process, safe_flow_creator, creators);
+          if (thread.hasChildren) {
+            reject(outOfControl());
+            return;
+          }
+          thread.dispose();
+          setCurrThread(parentThread);
+          reject(caught);
+          return;
+        } else if (result.length === CatchFirst.done) {
+          const [, done] = result;
+          thread.changeState(TraceState.thread_completed, done);
+          dropout(thread, process, safe_flow_creator, creators);
+          if (thread.hasChildren) {
+            reject(outOfControl());
+            return;
+          }
+          thread.dispose();
+          setCurrThread(parentThread);
+          resolve([null, done]);
+        } else {
+          throw report();
+        }
+      });
+      if (!thread.canceled) setCurrThread(parentThread);
+    }) as ReturnType<SafeFlowCreator<TReturn, TThis, TParam>>;
+
+    promise.safe_flow_promise = true;
+    promise.cancel = (reason?: any) => {
+      if (thread.promiseState !== PromiseState.pending)
+        throw new Error(
+          '[safe-flow] Unable to cancel a thread that has ended.'
+        );
+
+      internalCancelSelf(thread, reason);
+    };
+    promise.canceled = () => thread.canceled;
+    promise.state = () => thread.promiseState;
+
+    promise.errf = () => {
+      const errfPromise = promise
+        .then(([canceled, data]) => {
+          if (canceled === null)
+            return [null, null, data] as [null, null, TReturn];
+          return [null, canceled] as [null, Canceled];
+        })
+        .catch((error: Error) => {
+          if (error.message === outOfControlMsg) throw error;
+          return [error] as [unknown];
+        }) as any;
+
+      errfPromise.safe_flow_promise = true;
+      errfPromise.cancel = promise.cancel;
+      errfPromise.canceled = promise.canceled;
+      errfPromise.state = promise.state;
+
+      return errfPromise;
+    };
+
+    return promise;
+  } as any;
+}
+
+export function isSafeFlowPromise(promise: any) {
+  return promise.safe_flow_promise === true;
 }
 
 function dropout(
-  state: State,
-  safe_flow_run: SafeFlowRun,
-  runs: SafeFlowRun[],
-  onCanceled: OnCancel
+  thread: Thread,
+  process: Thread[],
+  creator: SafeFlowCreator,
+  creators: SafeFlowCreator[]
 ) {
-  state.on.splice(state.on.indexOf(onCanceled), 1);
-  if (state.on.length === 0) {
-    runMap.delete(safe_flow_run);
-    const i = runs.indexOf(safe_flow_run);
-    runs.splice(i, 1);
-    if (runs.length === 0) {
-      tokenMap.delete(state.token);
-      state.token = undefined;
-      //@ts-expect-error
-      state.on = undefined;
+  process.splice(process.indexOf(thread), 1);
+  if (process.length === 0) {
+    creatorProcesses.delete(creator);
+    creators.splice(creators.indexOf(creator), 1);
+    if (creators.length === 0) {
+      tokenCreators.delete(thread.token);
     }
   }
 }
 
-export function cancel(run: SafeFlowRun, reason?: any): void;
+export function cancel(creator: SafeFlowCreator, reason?: any): void;
 export function cancel(token?: any, reason?: any): void;
-export function cancel(tokenOrRun: any, reason?: any) {
-  internalCancel(tokenOrRun, reason, true);
+export function cancel(tokenOrCreator: any, reason?: any) {
+  const currThread = getCurrThread();
+  if (currThread && currThread.hasChildren) {
+    throw outOfControl();
+  }
+  internalCancel(currThread, tokenOrCreator, reason);
 }
 
 export function cancelAll(reason?: any) {
-  let isThrow = false;
-  tokenMap.forEach((_run, token) => {
-    const matched = internalCancel(token, reason);
-    if (!isThrow && matched) isThrow = true;
+  const currThread = getCurrThread();
+  if (currThread && currThread.hasChildren) {
+    throw outOfControl();
+  }
+  tokenCreators.forEach((_creator, token) => {
+    internalCancel(currThread, token, reason);
   });
-  if (isThrow) {
-    throw '[safe-flow] Stop the flow thread immediately.';
+  if (currThread) {
+    throw getBreakMsg();
   }
 }
 
-function internalCancel(tokenOrRun: any, reason?: any, isThrow = false) {
-  let matched = false;
-  if (typeof tokenOrRun === 'function' && tokenOrRun.name === 'safe_flow_run') {
-    const state = runMap.get(tokenOrRun);
-    if (state) {
-      const token = state.token;
-      state.canceled = true;
-      state.token = undefined;
-      state.on.forEach((cb) => {
-        if (!matched && running === cb) matched = true;
-        cb(reason);
+function internalCancel(
+  currThread: Thread | undefined,
+  tokenOrCreator: any,
+  reason?: any
+) {
+  let isThrow = false;
+  if (
+    typeof tokenOrCreator === 'function' &&
+    tokenOrCreator.name === 'safe_flow_creator'
+  ) {
+    const process = creatorProcesses.get(tokenOrCreator);
+    if (process) {
+      const token = process[0].token;
+      process.forEach((thread) => {
+        /* istanbul ignore if */
+        if (!thread.canceler) throw report();
+        thread.canceler(reason);
+        if (thread === currThread) isThrow = true;
       });
-      state.on.length = 0;
-      //@ts-expect-error
-      state.on = undefined;
-      runMap.delete(tokenOrRun);
-      //Expected warning. When the variable "state" exists, the variable "runs" below must also exist.
-      const runs = tokenMap.get(token)!;
-      const i = runs.indexOf(tokenOrRun);
-      runs.splice(i, 1);
-      if (runs.length === 0) {
-        tokenMap.delete(token);
+      process.length = 0;
+      creatorProcesses.delete(tokenOrCreator);
+
+      const creators = tokenCreators.get(token);
+      /* istanbul ignore if */
+      if (!creators) throw report();
+
+      const i = creators.indexOf(tokenOrCreator);
+      creators.splice(i, 1);
+      if (creators.length === 0) {
+        tokenCreators.delete(token);
       }
     }
   } else {
-    const runs = tokenMap.get(tokenOrRun);
-    if (runs) {
-      runs.forEach((run) => {
-        //Expected warning. When the variable "runs" exists, the variable "state" below must also exist.
-        const state = runMap.get(run)!;
-        state.canceled = true;
-        state.token = undefined;
-        state.on.forEach((cb) => {
-          if (!matched && running === cb) matched = true;
-          cb(reason);
+    const creators = tokenCreators.get(tokenOrCreator);
+    if (creators) {
+      creators.forEach((creator) => {
+        const process = creatorProcesses.get(creator);
+
+        /* istanbul ignore if */
+        if (!process) throw report();
+
+        process.forEach((thread) => {
+          /* istanbul ignore if */
+          if (!thread.canceler) throw report();
+
+          thread.canceler(reason);
+
+          if (thread === currThread) isThrow = true;
         });
-        state.on.length = 0;
-        //@ts-expect-error
-        state.on = undefined;
-        runMap.delete(run);
+        process.length = 0;
+        creatorProcesses.delete(creator);
       });
-      tokenMap.delete(tokenOrRun);
+      tokenCreators.delete(tokenOrCreator);
     }
   }
-  if (isThrow && matched) {
-    throw '[safe-flow] Stop the flow thread immediately.';
+  if (isThrow && currThread) {
+    throw getBreakMsg();
   }
-  return matched;
 }
 
-export function flowed<
-  TReturn = any,
-  T extends (...args: any[]) => Generator = (
-    ...args: any[]
-  ) => Generator<unknown, TReturn, unknown>
->(
-  generatorFunc: T & ((...args: any) => Generator<unknown, TReturn, unknown>)
-): (...args: Parameters<T>) => Promise<FlowResult<TReturn>> {
-  return generatorFunc as any;
+export function cancelSelf(reason?: any) {
+  const currThread = getCurrThread();
+  if (currThread) {
+    if (currThread.hasChildren) {
+      throw outOfControl();
+    }
+    internalCancelSelf(currThread, reason);
+    throw getBreakMsg();
+  } else {
+    throw new Error(
+      '[safe-flow] The cancelSelf method must be invoked in the currently running flow thread. Don not call it in other asynchronous callback.'
+    );
+  }
+}
+
+function internalCancelSelf(thread: Thread, reason?: any, isThrow = false) {
+  const { canceler } = thread;
+  /* istanbul ignore if */
+  if (!canceler) throw report();
+  canceler(reason, isThrow, false);
+}
+
+export function flowed<TReturn = any, TThis = any, TParam extends any[] = any>(
+  func: (this: TThis, ...args: TParam) => Promise<TReturn>
+): SafeFlowCreator<TReturn, TThis, TParam> {
+  return func as any;
 }
 
 export function flowup<T = any>(value: T, options?: FlowupOptions) {
@@ -435,31 +694,22 @@ export function flowup<T = any>(value: T, options?: FlowupOptions) {
   const target: Dictionary = value;
 
   if (options && options.names) {
-    const propKeys: string[] = [];
-    Object.getOwnPropertyNames(Object.getPrototypeOf(target)).forEach(
-      (propertyKey) => {
-        propKeys.push(propertyKey);
-      }
-    );
-    Object.getOwnPropertyNames(value).forEach((propertyKey) => {
-      propKeys.push(propertyKey);
-    });
     Object.keys(options.names).forEach((name) => {
-      if (!propKeys.includes(name))
-        throw new Error(
-          `[safe-flow] The attribute "${name}" provided in the names option does not exist on the target to be flowed up.`
+      if (typeof target[name] !== 'function')
+        throw new ReferenceError(
+          `[safe-flow] The specified attribute "${name}" found through the names option is not a function.`
         );
     });
   }
 
+  Object.getOwnPropertyNames(value).forEach((propertyKey) => {
+    internalFlowup(target, propertyKey, opts);
+  });
   Object.getOwnPropertyNames(Object.getPrototypeOf(target)).forEach(
     (propertyKey) => {
       internalFlowup(target, propertyKey, opts);
     }
   );
-  Object.getOwnPropertyNames(value).forEach((propertyKey) => {
-    internalFlowup(target, propertyKey, opts);
-  });
   return value;
 }
 
@@ -468,18 +718,29 @@ function internalFlowup(
   propertyKey: string,
   options: RequiredPick<FlowupOptions, 'filter'>
 ) {
-  const flowable = target[propertyKey].__safe_flow_flowable;
-  const filter = options.filter;
-  if (!flowable && !filter(propertyKey)) return;
+  if (propertyKey === 'constructor') return;
+
+  const flowable: undefined | FlowOptions | true | string =
+    target[propertyKey].__safe_flow_flowable ||
+    (options.names && options.names[propertyKey]);
+
+  if (!flowable) {
+    if (options.filter(propertyKey)) {
+      if (typeof target[propertyKey] !== 'function') return;
+    } else return;
+  }
 
   const { names, token, trace, standalone } = options;
   let name: string | undefined;
   if (trace && names) {
     const prop = names[propertyKey];
+    /* istanbul ignore else */
     if (prop === true) {
       name = propertyKey;
     } else if (prop) {
       name = prop;
+    } else {
+      throw report();
     }
   }
   const flowOpts = {
@@ -489,14 +750,18 @@ function internalFlowup(
     standalone,
   };
 
-  if (flowable) {
-    target[propertyKey] = flow(
-      target[propertyKey],
-      flowable === true ? flowOpts : defaults(flowable, flowOpts)
-    ).bind(target);
+  if (typeof flowable === 'object') {
+    target[propertyKey] = internalFlow(
+      target[propertyKey].bind(target),
+      defaults(flowable, flowOpts),
+      target
+    );
   } else {
-    if (isGeneratorFunction(target[propertyKey]))
-      target[propertyKey] = flow(target[propertyKey], flowOpts).bind(target);
+    target[propertyKey] = internalFlow(
+      target[propertyKey].bind(target),
+      flowOpts,
+      target
+    );
   }
 }
 
@@ -525,17 +790,7 @@ export function flowable(
       propertyKey: string,
       descriptor?: PropertyDescriptor //The ? mark for ES3
     ) => {
-      let generatorFunc: GeneratorFunction;
-      if (descriptor) {
-        generatorFunc = descriptor.value;
-      } else {
-        generatorFunc = target[propertyKey];
-      }
-      if (!isGeneratorFunction(generatorFunc)) {
-        throw new Error('[safe-flow] Only GeneratorFunction can be flowable.');
-      }
-      //@ts-expect-error
-      generatorFunc.__safe_flow_flowable = targetOrOptions;
+      internalFlowable(target, propertyKey, descriptor, targetOrOptions);
     };
   }
 }
@@ -543,35 +798,33 @@ export function flowable(
 function internalFlowable(
   target: any,
   propertyKey: string,
-  descriptor?: PropertyDescriptor //The ? mark for ES3
+  descriptor?: PropertyDescriptor, //The ? mark for ES3
+  options?: FlowOptions
 ) {
-  let generatorFunc: GeneratorFunction;
+  let func: Function;
   if (descriptor) {
-    generatorFunc = descriptor.value;
+    func = descriptor.value;
   } else {
-    generatorFunc = target[propertyKey];
+    func = target[propertyKey];
   }
-  if (!isGeneratorFunction(generatorFunc)) {
-    throw new Error('[safe-flow] Only GeneratorFunction can be flowable.');
+  if (typeof func !== 'function') {
+    throw new ReferenceError(
+      '[safe-flow] Cannot get the target function to be flowed. The "flowable" method decorator may not be used correctly.'
+    );
   }
+
   //@ts-expect-error
-  generatorFunc.__safe_flow_flowable = true;
+  func.__safe_flow_flowable = options ? options : true;
 }
 
-export function safeFlow<T>(
-  flow: ReturnType<SafeFlowRun<FlowResult<T>>>
-): Promise<SafeFlowResult<T>> {
-  return flow
-    .then(([canceled, data]) => {
-      if (canceled === null) return [null, null, data] as [null, null, T];
-      return [null, canceled] as [null, Canceled];
-    })
-    .catch((error) => {
-      return [new SafeCatched(error)] as [SafeCatched];
-    });
+function takeNumber(name: string) {
+  return ++names[name];
 }
 
-function uid() {
-  if (__debug_id) return __debug_id;
-  return Math.floor(Math.random() * 100000000).toString();
+let names: { [key: string]: number } = {};
+function registerName(name: string) {
+  if (name in names) {
+    throw new Error(`[safe-flow] Duplicate flow name "${name}".`);
+  }
+  names[name] = 0;
 }

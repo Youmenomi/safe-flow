@@ -1,108 +1,365 @@
-import { SafeCatched } from 'safe-catched';
 import {
   flow,
   flowable,
   flowup,
   Canceled,
   cancel,
-  flowed,
   cancelAll,
-  FlowResult,
-  safeFlow,
+  flowed,
+  cancelSelf,
+  __debug_enable,
+  __debug_live_threads,
   configure,
-  __debug_set_id,
+  __debug_logger,
+  __debug_clear_names,
+  PromiseState,
   FlowState,
+  TraceState,
+  __debug_clear_threads,
+  isSafeFlowPromise,
 } from '../src';
-import { isGeneratorFunction } from '../src/helper';
 import {
   checkType,
   delay,
+  EFR,
+  errfSimplify,
   error,
   fetch,
   FR,
-  safeSimplify,
-  SFR,
   simplify,
+  timeout,
   verify,
 } from './helper';
 
+//注意事項
+// 子flow一定要加await
+//不要trycatch(promise.catch)子flow
+//Promis.all 不要用flow包
+
 //mobx!!! next 要在 action中
 
+//內存測試
+//es3環境測看看
+//ES3 run test 看看
+//檢查 優化  test
+
+//TODO flowable 有給參數 跟沒有給參數  路線不同
+//class 和 function 是不同路線
+
+__debug_enable(true);
+
+enum CancelMethod {
+  cancelSelf,
+  cancelToken,
+  cancelCreator,
+  cancelAll,
+  promiseCancel,
+}
 describe('safe-flow', () => {
-  it('isGeneratorFunction', async () => {
-    expect(
-      isGeneratorFunction(function* () {
-        //
-      })
-    ).toBeTruthy();
-    expect(
-      isGeneratorFunction(() => {
-        //
-      })
-    ).toBeFalsy();
-    expect(isGeneratorFunction({})).toBeFalsy();
+  let print = false;
+  let i = 0;
+  const originalLog = __debug_logger.log;
+  const log = jest
+    .spyOn(__debug_logger, 'log')
+    .mockImplementation((...args: any[]) => {
+      if (print) originalLog(...args);
+    });
+
+  beforeEach(() => {
+    print = false;
+    configure();
+    i = 0;
+    log.mockClear();
+    __debug_clear_names();
   });
 
-  it('flow', async () => {
-    class Store {
-      foo1 = flow(function* () {
-        yield delay(5);
-        return yield fetch('foo1');
-      });
-      foo2 = function* () {
-        yield delay(5);
-        return yield fetch('foo2');
-      };
-    }
-    const store = new Store();
-    expect(await store.foo1()).toEqual([null, 'foo1']);
-    expect(await flow(store.foo2)()).toEqual([null, 'foo2']);
+  afterEach(async () => {
     verify();
+    await delay(50);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('errf', async () => {
+    class Store {
+      @flowable
+      async foo1(t: number) {
+        await flow(delay)(5);
+        return t.toString();
+      }
+
+      foo2 = flow(async (t: number) => {
+        return await flow(fetch)(t.toString());
+      });
+
+      foo3 = flow(async (t: number) => {
+        return await flow(fetch)(t.toString()).errf();
+      });
+
+      foo4 = flow(async (t: number) => {
+        return await this.foo1(t);
+      });
+
+      foo5 = flow(async (t: number) => {
+        return await flowed(this.foo1)(t).errf();
+      });
+    }
+    const store = flowup(new Store());
+
+    expect(await flowed(store.foo1)(5)).toEqual([null, '5']);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(await flowed(store.foo1)(5).errf()).toEqual([null, null, '5']);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    expect(await flowed(store.foo2)(5)).toEqual([null, [null, '5']]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(await flowed(store.foo2)(5).errf()).toEqual([
+      null,
+      null,
+      [null, '5'],
+    ]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    expect(await flowed(store.foo3)(5)).toEqual([null, [null, null, '5']]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(await flowed(store.foo3)(5).errf()).toEqual([
+      null,
+      null,
+      [null, null, '5'],
+    ]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    expect(await flowed(store.foo4)(5)).toEqual([null, [null, '5']]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(await flowed(store.foo4)(5).errf()).toEqual([
+      null,
+      null,
+      [null, '5'],
+    ]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    expect(await flowed(store.foo5)(5)).toEqual([null, [null, null, '5']]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(await flowed(store.foo5)(5).errf()).toEqual([
+      null,
+      null,
+      [null, null, '5'],
+    ]);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  describe('Cancel immediately cancel after the main thread starts', () => {
+    immediately_after_the_main_thread_starts(CancelMethod.cancelSelf);
+    immediately_after_the_main_thread_starts(CancelMethod.cancelToken);
+    immediately_after_the_main_thread_starts(CancelMethod.cancelCreator);
+    immediately_after_the_main_thread_starts(CancelMethod.cancelAll);
+  });
+
+  describe('Cancel immediately after the child thread ends', () => {
+    immediately_after_the_child_thread_ends(CancelMethod.cancelSelf);
+    immediately_after_the_child_thread_ends(CancelMethod.cancelToken);
+    immediately_after_the_child_thread_ends(CancelMethod.cancelCreator);
+    immediately_after_the_child_thread_ends(CancelMethod.cancelAll);
+  });
+
+  describe('Cancel outside the thread', () => {
+    outside_the_thread(CancelMethod.cancelToken);
+    outside_the_thread(CancelMethod.cancelCreator);
+    outside_the_thread(CancelMethod.cancelAll);
+    outside_the_thread(CancelMethod.promiseCancel);
   });
 
   it('flowup', async () => {
     class Store {
-      *foo1() {
-        yield delay(5);
-        return yield fetch('foo1');
+      foo1() {
+        return flow(fetch)('foo1');
+      }
+      foo2() {
+        return flow(fetch)('foo2');
       }
 
       @flowable
-      *foo2() {
-        yield delay(5);
-        return yield fetch('foo2');
+      async foo3() {
+        await flow(delay)(5);
+        return await flow(fetch)('foo3');
       }
 
-      *foo3() {
-        yield delay(5);
-        return yield fetch('foo3');
+      @flowable({ standalone: true })
+      async foo4() {
+        await flow(delay)(5);
+        return await flow(fetch)('foo4');
+      }
+
+      @flowable
+      async foo5() {
+        await flow(delay)(5);
+        return await flow(fetch)('foo5');
+      }
+
+      async foo6() {
+        await flow(delay)(5);
+        return await flow(fetch)('foo6');
       }
     }
     const store = new Store();
-    flowup(store, { filter: (name) => name === 'foo1' });
+    flowup(store, {
+      names: { foo1: true, foo5: true },
+      filter: (name) => name === 'foo2' || name === 'foo5',
+    });
 
-    expect(isGeneratorFunction(store.foo1)).toBeFalsy();
-    expect(isGeneratorFunction(store.foo2)).toBeFalsy();
-    expect(isGeneratorFunction(store.foo3)).toBeTruthy();
-    expect(await store.foo1()).toEqual([null, 'foo1']);
-    expect(await store.foo2()).toEqual([null, 'foo2']);
+    expect(store.foo1.name.includes('safe_flow_creator')).toBeTruthy();
+    expect(store.foo2.name.includes('safe_flow_creator')).toBeTruthy();
+    expect(store.foo3.name.includes('safe_flow_creator')).toBeTruthy();
+    expect(store.foo4.name.includes('safe_flow_creator')).toBeTruthy();
+    expect(store.foo5.name.includes('safe_flow_creator')).toBeTruthy();
+    expect(store.foo6.name).toBe('foo6');
+    expect(await store.foo1()).toEqual([null, [null, 'foo1']]);
+    expect(await store.foo2()).toEqual([null, [null, 'foo2']]);
+    expect(await store.foo3()).toEqual([null, [null, 'foo3']]);
+    expect(await store.foo4()).toEqual([null, [null, 'foo4']]);
+    expect(await store.foo5()).toEqual([null, [null, 'foo5']]);
+    expect(await store.foo6()).toEqual([null, 'foo6']);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
     expect(() => {
       flowup(store, {
         names: {
-          foo4: true,
+          foo7: true,
         },
       });
-    }).toThrowError(
-      '[safe-flow] The attribute "foo4" provided in the names option does not exist on the target to be flowed up.'
+    }).toThrow(
+      new ReferenceError(
+        '[safe-flow] The specified attribute "foo7" found through the names option is not a function.'
+      )
     );
+  });
+
+  describe('complete a thread', () => {
+    complete_a_thread();
+    complete_a_thread_return_values();
+  });
+
+  it('try/catch and .catch() on the child thread', async () => {
+    const func = jest.fn();
+    let breakMsg = '';
+    class Store {
+      @flowable({ token: 'token' })
+      async foo1() {
+        try {
+          await flow(fetch)(1);
+        } catch (error) {
+          breakMsg = error;
+        }
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo2() {
+        await flow(fetch)(1).catch((error) => {
+          breakMsg = error;
+        });
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo3() {
+        try {
+          await Promise.all([flow(fetch)(1), flow(fetch)(2), flow(fetch)(3)]);
+        } catch (error) {
+          breakMsg = error;
+        }
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo4() {
+        await Promise.all([
+          flow(fetch)(1),
+          flow(fetch)(2),
+          flow(fetch)(3),
+        ]).catch((error) => {
+          breakMsg = error;
+        });
+        func();
+      }
+    }
+    const store = flowup(new Store());
+
+    const flows = [store.foo1];
+    for (let i = 0; i < flows.length; i++) {
+      timeout(() => {
+        cancel('token');
+      }, 5);
+      await flow(async () => {
+        await flows[i]();
+      })();
+      expect(breakMsg).toBe(
+        '[safe-flow] Do not use try/catch and .catch() on threads. It causes the parent thread to not be interrupted as expected when cancelled. Use .errf() to receive exceptions instead.'
+      );
+      expect(func).toBeCalled();
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    }
+  });
+
+  it('use flowup names to set name', async () => {
+    configure({ trace: true });
+    class Store {
+      foo1() {
+        return flow(fetch)('foo1');
+      }
+      foo2() {
+        return flow(fetch)('foo1');
+      }
+    }
+    const store = new Store();
+    flowup(store, {
+      names: { foo1: true, foo2: 'fooooo2' },
+    });
+
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+    expect(log).nthCalledWith(++i, '[safe-flow] [fooooo2] Creator is created.');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('also set options in flowup names and flowable', async () => {
+    configure({ trace: true });
+    class Store {
+      @flowable({ name: 'nameFlowable', token: 'tokenFlowable' })
+      foo1() {
+        return flow(fetch)('foo1');
+      }
+    }
+    const store = new Store();
+    flowup(store, {
+      names: { foo1: 'nameFlowup' },
+      token: 'tokenFlowup',
+    });
+
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] [nameFlowable] Creator is created.'
+    );
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   it('flowable ES3', async () => {
     const foo1 = {
-      f1: function* () {
-        yield delay(5);
+      f1: async () => {
+        await flow(delay)(5);
       },
     };
     flowable(foo1, 'f1');
@@ -110,8 +367,8 @@ describe('safe-flow', () => {
     expect(foo1.f1.__safe_flow_flowable).toBeTruthy();
 
     const foo2 = {
-      f2: function* () {
-        yield delay(5);
+      f2: async () => {
+        await flow(delay)(5);
       },
     };
     flowable({})(foo2, 'f2');
@@ -121,8 +378,8 @@ describe('safe-flow', () => {
 
   it('standalone', async () => {
     const f1 = flow(
-      function* () {
-        yield delay(5);
+      async () => {
+        await flow(delay)(5);
       },
       { standalone: true }
     );
@@ -131,15 +388,18 @@ describe('safe-flow', () => {
     await f1();
     verify();
 
-    expect(
-      safeSimplify(
-        await Promise.all([safeFlow(f1()), safeFlow(f1()), safeFlow(f1())])
-      )
-    ).toEqual([SFR.fulfilled, SFR.error, SFR.error]);
+    await expect(async () => {
+      await Promise.all([f1(), f1(), f1()]);
+    }).rejects.toThrowError(
+      '[safe-flow] Standalone mode flow only allows one process to execute.'
+    );
+
+    await delay(10);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('cancel', async () => {
+  it('when disposing store, cancel the running thread to avoid subsequent exceptions.', async () => {
     const func = jest.fn();
     class Store {
       _disposed = false;
@@ -148,9 +408,9 @@ describe('safe-flow', () => {
       }
 
       @flowable
-      *foo(t: number) {
+      async foo(t: number) {
         func();
-        yield delay(t);
+        await flow(delay)(t);
         func();
         this.throw();
         func();
@@ -165,12 +425,13 @@ describe('safe-flow', () => {
     const store = new Store();
     flowup(store);
 
-    setTimeout(() => {
+    timeout(() => {
       store.dispose();
     }, 5);
-    const [, canceled] = await safeFlow(flowed(store.foo)(10));
+    const [, canceled] = await flowed(store.foo)(10).errf();
     expect(func).toBeCalledTimes(1);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
     expect(canceled).toBeInstanceOf(Canceled);
     if (canceled) {
       func.mockClear();
@@ -181,25 +442,26 @@ describe('safe-flow', () => {
         { baz: 'baz' },
       ]);
 
-      const [err] = await safeFlow(canceled.retry());
-      expect(err).toEqual(new SafeCatched(new Error('Error occurred!')));
+      const [err] = await canceled.retry().errf();
+      expect(err).toEqual(new Error('Error occurred!'));
       expect(func).toBeCalledTimes(2);
       verify();
+      expect(__debug_live_threads.length).toBe(0);
     }
   });
 
-  it('cancel one of flows', async () => {
+  it('cancel one of the parallel threads by creator', async () => {
     const func = jest.fn();
-    const f1 = flow(function* () {
-      yield delay(10);
+    const f1 = flow(async () => {
+      await flow(delay)(10);
       func();
     });
-    const f2 = flow(function* () {
-      yield delay(10);
+    const f2 = flow(async () => {
+      await flow(delay)(10);
       func();
     });
 
-    setTimeout(() => {
+    timeout(() => {
       cancel(f1);
     }, 5);
     expect(simplify(await Promise.all([f1(), f2()]))).toEqual([
@@ -208,28 +470,58 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(1);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('cancel by unused token or flow', async () => {
-    cancel('unused token');
-
-    const f1 = flow(function* () {
-      return yield fetch('foo1');
-    });
-    cancel(f1);
-  });
-
-  it('cancel by token', async () => {
+  it('cancel all child threads in the main thread', async () => {
     class Store {
       @flowable
-      *foo() {
-        yield delay(10);
+      async foo() {
+        await Promise.all([
+          flow(fetch, { token: 'token' })(1),
+          flow(fetch, { token: 'token' })(2),
+          flow(fetch, { token: 'token' })(3),
+        ]);
+        return 'foo';
+      }
+    }
+    const store = new Store();
+    flowup(store);
+
+    timeout(() => {
+      cancel('token');
+    }, 5);
+    await store.foo();
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    await delay(10);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('cancel by unused token or creator', async () => {
+    cancel('unused token');
+
+    const f1 = flow(async () => {
+      return await flow(fetch)('foo1');
+    });
+    cancel(f1);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('cancel parallel threads using various tokens', async () => {
+    class Store {
+      @flowable
+      async foo() {
+        await flow(delay)(10);
         return 'foo';
       }
 
-      async bar() {
-        return flow(function* () {
-          yield delay(10);
+      bar() {
+        return flow(async () => {
+          await flow(delay)(10);
           return 'foo';
         })();
       }
@@ -242,19 +534,19 @@ describe('safe-flow', () => {
     flowup(store);
 
     const f1 = flow(
-      function* () {
-        yield delay(10);
+      async () => {
+        await flow(delay)(10);
         return 'foo';
       },
       { token: store }
     );
-    const f2 = flow(function* () {
-      yield delay(10);
+    const f2 = flow(async () => {
+      await flow(delay)(10);
       return 'foo';
     });
     const f3 = flow(
-      function* () {
-        yield delay(10);
+      async () => {
+        await flow(delay)(10);
         return 'foo';
       },
       { token: 'token' }
@@ -272,9 +564,10 @@ describe('safe-flow', () => {
       FR.fulfilled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
     const ms = 5;
-    setTimeout(() => store.cancel(), ms);
+    timeout(() => store.cancel(), ms);
     expect(
       simplify(
         await Promise.all([flowed(store.foo)(), f1(), f2(), f3(), store.bar()])
@@ -287,8 +580,9 @@ describe('safe-flow', () => {
       FR.fulfilled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => cancel(), ms);
+    timeout(() => cancel(), ms);
     expect(
       simplify(
         await Promise.all([flowed(store.foo)(), f1(), f2(), f3(), store.bar()])
@@ -301,8 +595,9 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => cancel('token'), ms);
+    timeout(() => cancel('token'), ms);
     expect(
       simplify(
         await Promise.all([flowed(store.foo)(), f1(), f2(), f3(), store.bar()])
@@ -315,8 +610,9 @@ describe('safe-flow', () => {
       FR.fulfilled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => cancelAll(), ms);
+    timeout(() => cancelAll(), ms);
     expect(
       simplify(
         await Promise.all([flowed(store.foo)(), f1(), f2(), f3(), store.bar()])
@@ -329,11 +625,12 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('cancel by run', async () => {
-    const f1 = flow(function* () {
-      yield delay(10);
+  it('cancel parallel threads of the same creator', async () => {
+    const f1 = flow(async () => {
+      await flow(delay)(10);
       return 'foo';
     });
 
@@ -343,49 +640,52 @@ describe('safe-flow', () => {
       FR.fulfilled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => cancel(f1), 5);
+    timeout(() => cancel(f1), 5);
     expect(simplify(await Promise.all([f1(), f1(), f1()]))).toEqual([
       FR.canceled,
       FR.canceled,
       FR.canceled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => cancelAll(), 5);
+    timeout(() => cancelAll(), 5);
     expect(simplify(await Promise.all([f1(), f1(), f1()]))).toEqual([
       FR.canceled,
       FR.canceled,
       FR.canceled,
     ]);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('cancel in flow', async () => {
+  it('cancel parallel threads in the thread', async () => {
     const func = jest.fn();
-    const f1 = flow(function* () {
-      yield delay(10);
+    const f1 = flow(async () => {
+      await flow(delay)(10);
       func();
     });
-    const f2 = flow(function* () {
-      yield delay(10);
+    const f2 = flow(async () => {
+      await flow(delay)(10);
       func();
     });
-    const f3 = flow(function* () {
-      yield delay(5);
+    const f3 = flow(async () => {
+      await flow(delay)(5);
       cancelAll();
       func();
       throw Error('Error occurred!');
     });
     const f4 = flow(
-      function* () {
+      async () => {
         cancel('token');
         func();
         throw Error('Error occurred!');
       },
       { token: 'token' }
     );
-    const f5 = flow(function* () {
+    const f5 = flow(async () => {
       cancel(f5);
       func();
       throw Error('Error occurred!');
@@ -398,6 +698,7 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(0);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
     func.mockClear();
     expect(simplify(await Promise.all([f1(), f2(), f4()]))).toEqual([
@@ -407,6 +708,7 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(2);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
 
     func.mockClear();
     expect(simplify(await Promise.all([f1(), f2(), f5()]))).toEqual([
@@ -416,183 +718,632 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(2);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   it('cancel with reason', async () => {
     const f1 = flow(
-      function* () {
-        yield delay(10);
+      async () => {
+        await flow(delay)(10);
       },
       { token: 'token' }
     );
 
-    setTimeout(() => {
+    timeout(() => {
       cancelAll('foo');
     }, 5);
     let [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => {
+    timeout(() => {
       cancel('token', 'foo');
     }, 5);
     [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
 
-    setTimeout(() => {
+    timeout(() => {
       cancel(f1, 'foo');
     }, 5);
     [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('error validated', async () => {
-    const f1 = () => undefined;
-    //@ts-expect-error
-    expect(() => flow(f1)).toThrowError(
-      '[safe-flow] The target method is not a GeneratorFunction.'
+  it('cancelSelf', async () => {
+    const func = jest.fn();
+
+    class Store {
+      @flowable
+      async foo() {
+        await flow(delay)(10);
+        cancelSelf();
+        func();
+      }
+    }
+    const store = flowup(new Store());
+
+    timeout(() => {
+      expect(() => cancelSelf()).toThrowError(
+        '[safe-flow] The cancelSelf method must be invoked in the currently running flow thread. Don not call it in other asynchronous callback.'
+      );
+    }, 5);
+    let [canceled] = await flowed(store.foo)();
+    expect(canceled).toBeInstanceOf(Canceled);
+    expect(func).not.toBeCalled();
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    func.mockClear();
+    const f1 = flow(
+      async () => {
+        await flow(delay)(5);
+        cancelSelf('stop');
+        func();
+      },
+      { token: 'token' }
     );
 
-    try {
+    [canceled] = await f1();
+    expect(canceled).toBeDefined();
+    if (canceled) expect(canceled.reason).toBe('stop');
+    expect(func).not.toBeCalled();
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('cancel the terminated thread', async () => {
+    const func = jest.fn();
+
+    const f1 = flow(
+      async () => {
+        await flow(fetch)('123');
+        func();
+      },
+      { token: 'token' }
+    );
+
+    {
+      const promise = f1();
+      await promise;
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+      expect(promise.state()).toBe(PromiseState.fulfilled);
+
+      cancelAll();
+      cancel(f1);
+      cancel('token');
+
+      expect(() => promise.cancel()).toThrowError(
+        '[safe-flow] Unable to cancel a thread that has ended.'
+      );
+    }
+
+    {
+      const promise = f1();
+      await promise;
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+      expect(() => promise.cancel('stop')).toThrowError(
+        '[safe-flow] Unable to cancel a thread that has ended.'
+      );
+    }
+
+    {
+      func.mockClear();
+      const promise = f1();
+      timeout(() => {
+        promise.cancel('stop');
+      }, 5);
+      const [canceled] = await promise;
+      expect(canceled).toBeDefined();
+      if (canceled) expect(canceled.reason).toBe('stop');
+      expect(func).not.toBeCalled();
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+      expect(() => promise.cancel('stop')).toThrowError(
+        '[safe-flow] Unable to cancel a thread that has ended.'
+      );
+    }
+  });
+
+  it('Unable to detect illegal call to child thread', async () => {
+    const func = jest.fn();
+
+    class Store {
+      @flowable
+      async foo1() {
+        const foo2 = flow(fetch, { token: 'foo2' });
+        foo2('foo2').errf();
+        foo2('foo2').errf();
+        await foo2('foo2').errf();
+        func();
+        return 'foo1';
+      }
+    }
+    const store = flowup(new Store());
+
+    const [, done] = await flowed(store.foo1)();
+    expect(done).toBe('foo1');
+    expect(func).toBeCalledTimes(1);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('invoke child flow thread without the await operator', async () => {
+    const func = jest.fn();
+
+    {
       class Store {
         @flowable
         async foo1() {
-          return fetch('foo1');
+          const foo2 = flow(fetch, { token: 'foo2' });
+          foo2('foo2').errf();
+          foo2('foo2').errf();
+          foo2('foo2').errf();
+          func();
         }
       }
-      Store;
-    } catch (error) {
-      expect(error).toEqual(
-        new Error('[safe-flow] Only GeneratorFunction can be flowable.')
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)().errf();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
       );
+      expect(func).toBeCalledTimes(1);
     }
 
-    try {
-      class Store2 {
-        @flowable({ standalone: true })
-        async foo2() {
-          return fetch('foo2');
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(fetch, { token: 'foo2' });
+          foo2('foo2').errf();
+          cancelSelf();
+          func();
         }
       }
-      Store2;
-    } catch (error) {
-      expect(error).toEqual(
-        new Error('[safe-flow] Only GeneratorFunction can be flowable.')
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
       );
+      expect(func).toBeCalledTimes(0);
     }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(fetch, { token: 'foo2' });
+          Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
+          cancel(this);
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+      );
+      expect(func).toBeCalledTimes(0);
+    }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(fetch, { token: 'foo2' });
+          foo2('foo2');
+          cancel(foo2);
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+      );
+      expect(func).toBeCalledTimes(0);
+    }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(fetch, { token: 'foo2' });
+          Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
+          cancelAll();
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+      );
+      expect(func).toBeCalledTimes(0);
+    }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(fetch, { token: 'foo2' });
+          await foo2('foo2');
+          foo2('foo2');
+          cancel('foo2');
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)();
+      }).rejects.toThrowError(
+        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+      );
+      expect(func).toBeCalledTimes(0);
+    }
+
+    await delay(10);
+    verify(false);
+    __debug_clear_threads();
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('error occurred', async () => {
-    const func = jest.fn();
-    const f1 = flow(function* () {
-      try {
-        throw new Error('Error occurred!');
-      } catch (err) {
-        return 'foo';
-      }
-    });
-    let [, data] = (await f1()) as [unknown, any];
-    expect(data).toBe('foo');
-    expect(func).not.toBeCalled();
-    verify();
-
-    func.mockClear();
-    const f2 = flow(function* () {
-      try {
-        yield error();
-      } catch (err) {
-        return 'foo';
-      }
-      func();
-    });
-
-    [, data] = await f2();
-    expect(data).toBe('foo');
-    expect(func).not.toBeCalled();
-    verify();
-
-    func.mockClear();
-    const f3 = flow(function* () {
-      try {
-        yield error();
-      } catch (err) {
-        err;
-      }
-      func();
-      yield delay(5);
-      return 'foo';
-    });
-
-    [, data] = await f3();
-    expect(data).toBe('foo');
-    expect(func).toBeCalledTimes(1);
-    verify();
-
-    const f4 = flow(
-      function* () {
-        yield error(5);
-      },
-      { trace: true, standalone: true }
+  it('passing non-promise parameters', async () => {
+    await expect(async () => {
+      //@ts-expect-error
+      await flow(undefined)();
+    }).rejects.toThrowError(
+      new ReferenceError('[safe-flow] The func is not a function.')
     );
 
-    await safeFlow(f4());
-    verify();
+    //@ts-expect-error
+    const f1 = flow(() => undefined);
+    const result = await f1();
+    expect(result.length).toBe(FlowState.done);
+    if (result.length === FlowState.done) {
+      const [, done] = result;
+      expect(done).toBe(undefined);
+    }
+
+    {
+      class Store {
+        @flowable
+        foo1(value: string) {
+          return value;
+        }
+      }
+      const store = flowup(new Store());
+      const result = await store.foo1('test');
+      expect(result.length).toBe(FlowState.done);
+      if (result.length === FlowState.done) {
+        const [, done] = result;
+        expect(done).toBe('test');
+      }
+    }
+    {
+      class Store {
+        @flowable({ standalone: true })
+        foo1(value: string) {
+          return value;
+        }
+      }
+      const store = flowup(new Store());
+      const result = await store.foo1('test');
+      expect(result.length).toBe(FlowState.done);
+      if (result.length === FlowState.done) {
+        const [, done] = result;
+        expect(done).toBe('test');
+      }
+    }
+    {
+      class Store {
+        foo1(value: string) {
+          return value;
+        }
+      }
+      const store = flowup(new Store(), {
+        names: { foo1: true },
+      });
+      //@ts-expect-error
+      const result = await flowed(store).foo1('test');
+      expect(result.length).toBe(FlowState.done);
+      if (result.length === FlowState.done) {
+        const [, done] = result;
+        expect(done).toBe('test');
+      }
+    }
+    {
+      class Store {
+        foo1(value: string) {
+          return value;
+        }
+      }
+      const store = flowup(new Store(), {
+        filter: (name) => name === 'foo1',
+      });
+      //@ts-expect-error
+      const result = await flowed(store).foo1('test');
+      expect(result.length).toBe(FlowState.done);
+      if (result.length === FlowState.done) {
+        const [, done] = result;
+        expect(done).toBe('test');
+      }
+    }
+
+    {
+      expect(() => {
+        class Store {
+          @flowable({ standalone: true })
+          foo1 = '123';
+        }
+        Store;
+      }).toThrow(
+        new ReferenceError(
+          '[safe-flow] Cannot get the target function to be flowed. The "flowable" method decorator may not be used correctly.'
+        )
+      );
+    }
+    {
+      expect(() => {
+        class Store {
+          @flowable
+          foo1 = '123';
+        }
+        Store;
+      }).toThrow(
+        new ReferenceError(
+          '[safe-flow] Cannot get the target function to be flowed. The "flowable" method decorator may not be used correctly.'
+        )
+      );
+    }
+    {
+      expect(() => {
+        class Store {
+          foo1 = '123';
+        }
+        flowup(new Store(), {
+          names: { foo1: true },
+        });
+      }).toThrow(
+        new ReferenceError(
+          '[safe-flow] The specified attribute "foo1" found through the names option is not a function.'
+        )
+      );
+    }
+    {
+      class Store {
+        foo1 = '123';
+      }
+      const store = flowup(new Store(), {
+        filter: (name) => name === 'foo1',
+      });
+      expect(store.foo1).toBe('123');
+    }
   });
 
-  it('error in Parallel flows', async () => {
+  it('an error occurred in the thread', async () => {
+    const f1 = flow(
+      async () => {
+        await flow(error)(5);
+      },
+      { standalone: true }
+    );
+
+    await expect(async () => await f1()).rejects.toThrowError(
+      'Error occurred!'
+    );
+
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('an error occurred in the thread with trace', async () => {
+    configure({ trace: true });
+
+    const f1 = flow(
+      async () => {
+        throw new Error('Error occurred!');
+      },
+      { name: 'foo1' }
+    );
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+
+    const [caught] = await f1().errf();
+    expect(caught).toEqual(new Error('Error occurred!'));
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [foo1].'
+    );
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] [foo1](1): error Error: Error occurred!'
+    );
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).toBeCalledTimes(i);
+  });
+
+  it('error in Parallel threads', async () => {
     const func = jest.fn();
     let i = 0;
-    const f1 = flow(function* () {
+    const f1 = flow(async () => {
       if (++i === 2) throw new Error('Error occurred!');
-      yield delay(5);
+      await flow(delay)(5);
       func();
     });
-    const f2 = flow(function* () {
-      yield delay(5);
+    const f2 = flow(async () => {
+      await delay(5);
       func();
     });
 
     expect(
-      safeSimplify(
-        await Promise.all([safeFlow(f1()), safeFlow(f1()), safeFlow(f2())])
-      )
-    ).toEqual([SFR.fulfilled, SFR.error, SFR.fulfilled]);
+      errfSimplify(await Promise.all([f1().errf(), f1().errf(), f2().errf()]))
+    ).toEqual([EFR.fulfilled, EFR.error, EFR.fulfilled]);
     expect(func).toBeCalledTimes(2);
     verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('yield without promise', async () => {
-    const f1 = flow(function* () {
-      return yield 'foo';
+  it('flow an asynchronous function without asynchronous operation', async () => {
+    const f1 = flow(async () => {
+      return 'foo';
     });
 
-    const [, data] = await f1();
-    expect(data).toBe('foo');
+    const [, done] = await f1();
+    expect(done).toBe('foo');
     verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('duplicate flow name', async () => {
+    configure({ trace: true });
+    class Store {
+      @flowable({ name: 'foo' })
+      foo1(value: string) {
+        return value;
+      }
+
+      @flowable({ name: 'foo' })
+      foo2(value: string) {
+        return value;
+      }
+    }
+
+    expect(() => flowup(new Store())).toThrowError(
+      '[safe-flow] Duplicate flow name "foo".'
+    );
+  });
+
+  it('isSafeFlowPromise', async () => {
+    const f1 = flow(async () => {
+      await flow(fetch)(1);
+    });
+
+    {
+      const promise = f1();
+      expect(isSafeFlowPromise(promise)).toBeTruthy();
+      await promise;
+    }
+
+    {
+      const promise = f1().errf();
+      expect(isSafeFlowPromise(promise)).toBeTruthy();
+      await promise;
+    }
+
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('canceled value of safe flow romise', async () => {
+    const f1 = flow(async () => {
+      await flow(fetch)(1);
+    });
+
+    {
+      const promise = f1();
+      await promise;
+      expect(promise.canceled()).toBeFalsy();
+    }
+
+    {
+      const promise = f1();
+      timeout(() => {
+        promise.canceled();
+      }, 5);
+      await promise;
+      expect(promise.canceled()).toBeFalsy();
+    }
+
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   it('type', async () => {
     class Store {
       @flowable
-      *foo1(t: number) {
-        yield delay(t);
-        return 'foo1';
+      async foo1(this: Store, t: number) {
+        return t.toString();
       }
 
-      foo2 = flow(function* (t: number) {
-        yield delay(t);
-        return (yield fetch('foo2')) as string;
+      foo2 = flow(async (t: number) => {
+        return await flow(fetch)(t.toString());
       });
 
-      foo3 = flow(function* (t: number) {
-        yield delay(t);
-        return yield fetch('foo3');
+      foo3 = flow(async (t: number) => {
+        return await flow(fetch)(t.toString()).errf();
       });
     }
-    const store = new Store();
+    const store = flowup(new Store());
 
-    checkType<FlowResult<string>>(await flowed(store.foo1)(5));
-    checkType<FlowResult<string>>(await store.foo2(5));
-    checkType<FlowResult<undefined>>(await store.foo3(5));
+    checkType<[Canceled] | [null, string]>(await flowed(store.foo1)(5));
+
+    {
+      const result = await flowed(store.foo1)(5);
+      checkType<[Canceled] | [null, string]>(result);
+      if (result.length === 1) {
+        const [canceled] = result;
+        checkType<Store>(canceled.thisArg);
+      }
+    }
+    {
+      const result = await flowed(store.foo1)(5).errf();
+      checkType<[unknown] | [null, Canceled] | [null, null, string]>(result);
+      if (result.length === 2) {
+        const [, canceled] = result;
+        checkType<Store>(canceled.thisArg);
+      }
+    }
+
+    checkType<[Canceled] | [null, [Canceled] | [null, string]]>(
+      await store.foo2(5)
+    );
+    checkType<
+      [unknown] | [null, Canceled] | [null, null, [Canceled] | [null, string]]
+    >(await store.foo2(5).errf());
+
+    checkType<
+      [Canceled] | [null, [unknown] | [null, Canceled] | [null, null, string]]
+    >(await store.foo3(5));
+    checkType<
+      | [unknown]
+      | [null, Canceled]
+      | [null, null, [unknown] | [null, Canceled] | [null, null, string]]
+    >(await store.foo3(5).errf());
   });
 
   it('nested flow', async () => {
@@ -600,368 +1351,498 @@ describe('safe-flow', () => {
     const func2 = jest.fn();
     const func3 = jest.fn();
     const func = jest.fn();
-
     class Store {
       @flowable
-      *f1(t: number) {
-        yield delay(t);
+      async f1(t: number) {
+        await flow(delay)(t);
         func();
       }
     }
     const store = flowup(new Store());
 
-    const f2 = flow(function* () {
-      yield Promise.all([store.f1(5), delay(30)]);
+    const f2 = flow(async () => {
+      await Promise.all([flowed(store.f1)(5), flow(delay)(30)]);
       cancelAll();
       func1();
     });
-    const f3 = flow(function* () {
-      yield delay(10);
-      yield f2();
+    const f3 = flow(async () => {
+      await flow(delay)(10);
+      await f2();
       func2();
     });
-    const f4 = flow(function* () {
-      yield Promise.all([store.f1(50), f3(), f2()]);
+    const f4 = flow(async () => {
+      await Promise.all([flowed(store.f1)(50), f3(), f2()]);
       func3();
     });
 
     await f4();
     verify();
+    expect(__debug_live_threads.length).toBe(0);
     expect(func).toBeCalledTimes(2);
     expect(func1).not.toBeCalled();
     expect(func2).not.toBeCalled();
     expect(func3).not.toBeCalled();
   });
 
-  describe('trace', () => {
-    let i = 0;
-    const log = jest
-      .spyOn(global.console, 'log')
-      .mockImplementation(() => true);
-
-    beforeEach(() => {
-      configure();
-      i = 0;
-      log.mockClear();
-      __debug_set_id();
+  it('custom trace', async () => {
+    // print = true;
+    configure({
+      trace: (event) => {
+        __debug_logger.log(event.name, event.state);
+      },
+      standalone: true,
     });
 
-    it('uid', async () => {
-      const f1 = flow(
-        function* () {
-          return yield 'foo';
-        },
-        { trace: true, name: 'f1' }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: created');
-
-      __debug_set_id('00001');
-      await f1();
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1](00001): start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f1](00001): completed foo'
-      );
-      expect(console.log).toBeCalledTimes(i);
-
-      __debug_set_id();
-      await f1();
-      verify();
-      expect(console.log).not.nthCalledWith(
-        ++i,
-        '[safe-flow] [f1](00001): start'
-      );
-      expect(console.log).not.nthCalledWith(
-        ++i,
-        '[safe-flow] [f1](00001): completed foo'
-      );
-      expect(console.log).toBeCalledTimes(i);
-      verify();
-    });
-
-    it('overwrite', async () => {
-      configure({
-        trace: true,
-        standalone: true,
-        filter: (name) => name === 'f005',
-      });
-      class Store {
-        @flowable({ name: 'foo1', token: 'token' })
-        *foo1() {
-          yield delay(10);
-        }
-
-        *foo2() {
-          yield delay(10);
-        }
-
-        @flowable({ name: 'f003', standalone: false })
-        *foo3() {
-          yield delay(10);
-        }
-
-        @flowable({ trace: false })
-        *foo4() {
-          yield delay(10);
-        }
-
-        @flowable
-        *f005() {
-          yield delay(10);
-        }
+    class Store {
+      @flowable({ name: 'foo1' })
+      async foo1() {
+        await flow(fetch, { name: 'foo2' })('foo1');
+        cancelSelf();
       }
-      const store = new Store();
-      flowup(store, {
-        filter: (name) => name.indexOf('foo') === 0,
-        names: {
-          foo2: true,
-          foo3: 'foo3',
-          foo4: true,
-        },
-      });
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo1]: created');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: created');
+    }
+    const store = flowup(new Store());
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.creator_created);
 
-      setTimeout(() => {
-        cancel('token');
-      }, 5);
-      expect(
-        safeSimplify(
-          await Promise.all([
-            safeFlow(flowed(store.foo1)()),
-            safeFlow(flowed(store.foo2)()),
-            safeFlow(flowed(store.foo2)()),
-            (async () => {
-              __debug_set_id('00001');
-            })(),
-            safeFlow(flowed(store.foo3)()),
-            (async () => {
-              __debug_set_id('00002');
-            })(),
-            safeFlow(flowed(store.foo3)()),
-            (async () => {
-              __debug_set_id();
-            })(),
-            safeFlow(flowed(store.foo4)()),
-            safeFlow(flowed(store.f005)()),
-          ])
-        )
-      ).toEqual([
-        SFR.canceled,
-        SFR.fulfilled,
-        SFR.error,
-        SFR.none,
-        SFR.fulfilled,
-        SFR.none,
-        SFR.fulfilled,
-        SFR.none,
-        SFR.fulfilled,
-        SFR.fulfilled,
-      ]);
-      verify();
+    await flowed(store.foo1)();
+    verify();
 
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f003]: created');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo1]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo1]: await-start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: await-start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [foo2]: error Error: [safe-flow] Standalone mode only allows one flow to run alone.'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00001): start'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00001): await-start'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00002): start'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00002): await-start'
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo1]: canceled');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [foo1]: await-ended (canceled)'
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: await-ended');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [foo2]: completed');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00001): await-ended'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00001): completed'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00002): await-ended'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f003](00002): completed'
-      );
-      expect(console.log).toBeCalledTimes(i);
-    });
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_start);
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [foo1].'
+    );
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.creator_created);
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_start);
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [foo2].'
+    );
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [foo1].'
+    );
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_completed);
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_terminated);
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [foo1].'
+    );
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_canceled);
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).toBeCalledTimes(i);
 
-    it('error', async () => {
-      const f1 = flow(
-        function* () {
-          throw 123;
-        },
-        { trace: true, name: 'f1', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: created');
-
-      await safeFlow(f1());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: error 123');
-      expect(console.log).toBeCalledTimes(i);
-
-      const f2 = flow(
-        function* () {
-          yield delay(5);
-          throw 123;
-        },
-        { trace: true, name: 'f2', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f2]: created');
-
-      await safeFlow(f2());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f2]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f2]: await-start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f2]: await-ended');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f2]: error 123');
-      expect(console.log).toBeCalledTimes(i);
-
-      const f3 = flow(
-        function* () {
-          try {
-            yield error(5);
-          } catch (error) {}
-        },
-        { trace: true, name: 'f3', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f3]: created');
-
-      await safeFlow(f3());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f3]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f3]: await-start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f3]: await-ended (error)'
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f3]: completed');
-      expect(console.log).toBeCalledTimes(i);
-
-      const f4 = flow(
-        function* () {
-          yield error(5);
-        },
-        { trace: true, name: 'f4', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f4]: created');
-
-      await safeFlow(f4());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f4]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f4]: await-start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f4]: await-ended (error)'
-      );
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f4]: error Error: Error occurred!'
-      );
-      expect(console.log).toBeCalledTimes(i);
-    });
-
-    it('canceled', async () => {
-      const f1 = flow(
-        function* () {
-          yield delay(10);
-        },
-        { trace: true, name: 'f1', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: created');
-
-      setTimeout(() => {
-        cancelAll('stop!');
-      }, 5);
-      await safeFlow(f1());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: await-start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f1]: canceled stop!'
-      );
-      expect(console.log).toBeCalledTimes(i);
-
-      await delay(5);
-      verify();
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f1]: await-ended (canceled)'
-      );
-      expect(console.log).toBeCalledTimes(i);
-    });
-
-    it('await', async () => {
-      const f1 = flow(
-        function* () {
-          yield fetch('foo');
-        },
-        { trace: true, name: 'f1', standalone: true }
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: created');
-
-      await safeFlow(f1());
-      verify();
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: start');
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: await-start');
-      expect(console.log).nthCalledWith(
-        ++i,
-        '[safe-flow] [f1]: await-ended foo'
-      );
-      expect(console.log).nthCalledWith(++i, '[safe-flow] [f1]: completed');
-      expect(console.log).toBeCalledTimes(i);
-    });
-
-    it('customization', async () => {
-      configure({
-        trace: (event) => {
-          console.log(event.name, event.state);
-        },
-        standalone: true,
-      });
-      class Store {
-        @flowable({ name: 'foo1' })
-        *foo1() {
-          return 'foo1';
-        }
-      }
-      const store = flowup(new Store());
-      expect(console.log).nthCalledWith(++i, 'foo1', FlowState.created);
-
-      await flowed(store.foo1)();
-      verify();
-      expect(console.log).nthCalledWith(++i, 'foo1', FlowState.start);
-      expect(console.log).nthCalledWith(++i, 'foo1', FlowState.completed);
-      expect(console.log).toBeCalledTimes(i);
-    });
+    await delay(10);
+    expect(log).nthCalledWith(
+      ++i,
+      'foo1',
+      TraceState.thread_completed_canceled
+    );
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_terminated);
+    expect(log).toBeCalledTimes(i);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
+
+  it('verify', async () => {
+    verify();
+    await delay(100);
+    verify();
+  });
+
+  it('Turn off debug enable', async () => {
+    __debug_enable(false);
+    const [, done] = await flow(fetch)(1);
+    expect(done).toBe(1);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  function immediately_after_the_main_thread_starts(
+    method: CancelMethod,
+    isTrace = true
+  ) {
+    if (isTrace) immediately_after_the_main_thread_starts(method, false);
+
+    const name = (() => {
+      switch (method) {
+        case CancelMethod.cancelSelf:
+          return 'cancel itself by cancelSelf';
+        case CancelMethod.cancelToken:
+          return 'cancel itself by token';
+        case CancelMethod.cancelCreator:
+          return 'cancel itself by creator';
+        case CancelMethod.cancelAll:
+          return 'cancel itself by cancelAll';
+        default:
+          throw new RangeError(`This parameter is not supported.`);
+      }
+    })();
+    it(`${name}${isTrace ? ' with trace' : ''}`, async () => {
+      // print = true;
+      configure({ trace: isTrace });
+      const func = jest.fn();
+
+      const foo1 = flow(
+        async (t: number) => {
+          switch (method) {
+            case CancelMethod.cancelSelf:
+              cancelSelf('stop');
+              break;
+            case CancelMethod.cancelToken:
+              cancel('token', 'stop');
+              break;
+            case CancelMethod.cancelCreator:
+              cancel(foo1, 'stop');
+              break;
+            case CancelMethod.cancelAll:
+              cancelAll('stop');
+              break;
+          }
+          func();
+          return t.toString();
+        },
+        { name: 'foo1', token: 'token' }
+      );
+
+      const [canceled] = await flowed(foo1)(5);
+      verify();
+      expect(canceled).toBeInstanceOf(Canceled);
+      if (canceled) {
+        expect(canceled.reason).toBe('stop');
+      }
+      expect(func).toBeCalledTimes(0);
+
+      if (!isTrace) {
+        expect(__debug_live_threads.length).toBe(0);
+        return;
+      }
+
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled stop');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).toBeCalledTimes(i);
+      expect(__debug_live_threads.length).toBe(1);
+      await delay(10);
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] [foo1](1): completed (canceled)'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).toBeCalledTimes(i);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  }
+
+  function immediately_after_the_child_thread_ends(
+    method: CancelMethod,
+    isTrace = true
+  ) {
+    if (isTrace) immediately_after_the_child_thread_ends(method, false);
+
+    const name = (() => {
+      switch (method) {
+        case CancelMethod.cancelSelf:
+          return 'cancel itself by cancelSelf';
+        case CancelMethod.cancelToken:
+          return 'cancel itself by token';
+        case CancelMethod.cancelCreator:
+          return 'cancel itself by creator';
+        case CancelMethod.cancelAll:
+          return 'cancel itself by cancelAll';
+        default:
+          throw new RangeError(`This parameter is not supported.`);
+      }
+    })();
+    it(`${name}${isTrace ? ' with trace' : ''}`, async () => {
+      // print = true;
+      configure({ trace: isTrace });
+      const func = jest.fn();
+
+      const foo1 = flow(
+        async (t: number) => {
+          await flow(fetch, { name: 'foo2' })('123');
+          switch (method) {
+            case CancelMethod.cancelSelf:
+              cancelSelf('stop');
+              break;
+            case CancelMethod.cancelToken:
+              cancel('token', 'stop');
+              break;
+            case CancelMethod.cancelCreator:
+              cancel(foo1, 'stop');
+              break;
+            case CancelMethod.cancelAll:
+              cancelAll('stop');
+              break;
+          }
+          func();
+          return t.toString();
+        },
+        { name: 'foo1', token: 'token' }
+      );
+
+      const [canceled] = await flowed(foo1)(5);
+      verify();
+      expect(canceled).toBeInstanceOf(Canceled);
+      if (canceled) {
+        expect(canceled.reason).toBe('stop');
+      }
+      expect(func).toBeCalledTimes(0);
+
+      if (!isTrace) {
+        expect(__debug_live_threads.length).toBe(0);
+        return;
+      }
+
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo2].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): completed 123');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): terminated');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled stop');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).toBeCalledTimes(i);
+      expect(__debug_live_threads.length).toBe(1);
+      await delay(10);
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] [foo1](1): completed (canceled)'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).toBeCalledTimes(i);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  }
+
+  function outside_the_thread(method: CancelMethod, isTrace = true) {
+    if (isTrace) outside_the_thread(method, false);
+
+    const name = (() => {
+      switch (method) {
+        case CancelMethod.cancelToken:
+          return 'cancel itself by token';
+        case CancelMethod.cancelCreator:
+          return 'cancel itself by creator';
+        case CancelMethod.cancelAll:
+          return 'cancel itself by cancelAll';
+        case CancelMethod.promiseCancel:
+          return 'cancel itself by promise.cancel';
+        default:
+          throw new RangeError(`This parameter is not supported.`);
+      }
+    })();
+    it(`${name}${isTrace ? ' with trace' : ''}`, async () => {
+      // print = true;
+      configure({ trace: isTrace });
+      const func = jest.fn();
+
+      const foo1 = flow(
+        async (t: number) => {
+          await flow(fetch, { name: 'foo2' })('123');
+          func();
+          return t.toString();
+        },
+        { name: 'foo1', token: 'token' }
+      );
+
+      const promise = flowed(foo1)(5);
+      timeout(() => {
+        switch (method) {
+          case CancelMethod.cancelToken:
+            cancel('token');
+            break;
+          case CancelMethod.cancelCreator:
+            cancel(foo1);
+            break;
+          case CancelMethod.cancelAll:
+            cancelAll();
+            break;
+          case CancelMethod.promiseCancel:
+            promise.cancel();
+            break;
+        }
+      }, 5);
+      const [canceled] = await promise;
+      verify();
+      expect(canceled).toBeInstanceOf(Canceled);
+      if (canceled) {
+        expect(canceled.reason).toBeUndefined();
+      }
+      expect(func).toBeCalledTimes(0);
+
+      if (!isTrace) {
+        expect(__debug_live_threads.length).toBe(0);
+        return;
+      }
+
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo2].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): canceled');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(__debug_live_threads.length).toBe(2);
+      await delay(1);
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] [foo1](1): completed (canceled)'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(__debug_live_threads.length).toBe(1);
+      await delay(10);
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] [foo2](1): completed (canceled) 123'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): terminated');
+      expect(log).toBeCalledTimes(i);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  }
+
+  function complete_a_thread(isTrace = true) {
+    if (isTrace) complete_a_thread(false);
+
+    it(`${isTrace ? ' with trace' : 'without trace'}`, async () => {
+      // print = true;
+      configure({ trace: isTrace });
+
+      const foo1 = flow(delay, { name: 'foo1' });
+      const [, done] = await foo1(5);
+      expect(done).toBeUndefined();
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+
+      if (!isTrace) {
+        expect(__debug_live_threads.length).toBe(0);
+        return;
+      }
+
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).toBeCalledTimes(i);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  }
+
+  function complete_a_thread_return_values(isTrace = true) {
+    if (isTrace) complete_a_thread_return_values(false);
+
+    it(`return values${isTrace ? ' with trace' : ''}`, async () => {
+      // print = true;
+      configure({ trace: isTrace });
+
+      const foo1 = flow(fetch, { name: 'foo1' });
+      const [, done] = await foo1('123', 5);
+      expect(done).toBe('123');
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+
+      if (!isTrace) {
+        expect(__debug_live_threads.length).toBe(0);
+        return;
+      }
+
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Change the current thread pointer to [foo1].'
+      );
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed 123');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(
+        ++i,
+        '[safe-flow] Clear the current thread pointer.'
+      );
+      expect(log).toBeCalledTimes(i);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  }
 });
