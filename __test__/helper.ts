@@ -40,7 +40,7 @@ export function delay(t: number) {
   });
 }
 
-export async function fetch<T = any>(r: T, t = 10): Promise<T> {
+export async function response<T = any>(r: T, t = 10): Promise<T> {
   await delay(t);
   return r;
 }

@@ -17,6 +17,9 @@ import {
   TraceState,
   __debug_clear_threads,
   isSafeFlowPromise,
+  Thread,
+  plugins,
+  Plugin,
 } from '../src';
 import {
   checkType,
@@ -24,27 +27,28 @@ import {
   EFR,
   errfSimplify,
   error,
-  fetch,
+  response,
   FR,
   simplify,
   timeout,
   verify,
 } from './helper';
-
-//注意事項
-// 子flow一定要加await
-//不要trycatch(promise.catch)子flow
-//Promis.all 不要用flow包
-
-//mobx!!! next 要在 action中
-
-//內存測試
-//es3環境測看看
-//ES3 run test 看看
-//檢查 優化  test
-
-//TODO flowable 有給參數 跟沒有給參數  路線不同
-//class 和 function 是不同路線
+import {
+  computed,
+  configure as mobxConfigure,
+  makeObservable,
+  observable,
+  _startAction,
+  _endAction,
+  autorun,
+  IActionRunInfo,
+  makeAutoObservable,
+  action,
+} from 'mobx';
+import axios from 'axios';
+import MockAdapter from 'axios-mock-adapter';
+import fetchMock from 'fetch-mock';
+import 'cross-fetch/polyfill';
 
 __debug_enable(true);
 
@@ -80,6 +84,580 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
+  describe('fetch', () => {
+    fetchMock.mock('/foo', 200, { delay: 50 });
+    it('abort fetch directly', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const f1 = flow(async () => {
+        try {
+          const result = await fetch('/foo', {
+            signal,
+          });
+          func1();
+          return result;
+        } catch (error) {
+          input(error.name, error.message);
+        }
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        controller.abort();
+      }, 5);
+      await f2();
+      expect(input).lastCalledWith('AbortError', 'The operation was aborted.');
+      expect(func1).not.toBeCalled();
+      expect(func2).toBeCalled();
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+
+    it('only cancel thread', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const f1 = flow(async () => {
+        const result = await fetch('/foo', {
+          signal,
+        });
+        func1();
+        return result;
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        cancel(f2);
+      }, 5);
+      await f2();
+      expect(input).not.toBeCalled();
+      expect(func1).not.toBeCalled();
+      expect(func2).not.toBeCalled();
+      verify();
+      await delay(60);
+      expect(__debug_live_threads.length).toBe(0);
+    });
+
+    it('abort fetch in onCancel when the thread is cancelled', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const f1 = flow(async () => {
+        const result = await flow(fetch)('/foo', {
+          signal,
+        })
+          .errf()
+          .onCancel((reason: any) => {
+            controller.abort();
+            input(reason);
+          });
+        func1();
+        return result;
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        cancel(f2, '123');
+      }, 5);
+      await f2();
+      expect(input).lastCalledWith('123');
+      expect(func1).not.toBeCalled();
+      expect(func2).not.toBeCalled();
+      verify();
+      await delay(10);
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  });
+
+  describe('axios', () => {
+    const CancelToken = axios.CancelToken;
+    const mock = new MockAdapter(axios, { delayResponse: 50 });
+    mock.onGet('/foo').reply(200);
+    it('cancel request directly', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const source = CancelToken.source();
+      const f1 = flow(async () => {
+        try {
+          const result = await axios.get('/foo', {
+            cancelToken: source.token,
+          });
+          func1();
+          return result;
+        } catch (error) {
+          input(axios.isCancel(error), error);
+        }
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        source.cancel('123');
+      }, 5);
+      await f2();
+      expect(input).lastCalledWith(true, { message: '123' });
+      expect(func1).not.toBeCalled();
+      expect(func2).toBeCalled();
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+    });
+
+    it('only cancel thread', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const CancelToken = axios.CancelToken;
+      const source = CancelToken.source();
+      const mock = new MockAdapter(axios, { delayResponse: 50 });
+      mock.onGet('/foo').reply(200);
+      const f1 = flow(async () => {
+        try {
+          const result = await axios.get('/foo', {
+            cancelToken: source.token,
+          });
+          func1();
+          return result;
+        } catch (error) {
+          input(axios.isCancel(error), error);
+        }
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        cancel(f2);
+      }, 5);
+      await f2();
+      expect(input).not.toBeCalled();
+      expect(func1).not.toBeCalled();
+      expect(func2).not.toBeCalled();
+      verify();
+      await delay(60);
+      expect(__debug_live_threads.length).toBe(0);
+    });
+
+    it('cancel request in onCancel when the thread is cancelled', async () => {
+      const input = jest.fn();
+      const func1 = jest.fn();
+      const func2 = jest.fn();
+      const CancelToken = axios.CancelToken;
+      const source = CancelToken.source();
+      const mock = new MockAdapter(axios, { delayResponse: 50 });
+      mock.onGet('/foo').reply(200);
+      const get = flow(axios.get);
+      const f1 = flow(async () => {
+        const result = await get('/foo', {
+          cancelToken: source.token,
+        })
+          .errf()
+          .onCancel((reason: any) => {
+            source.cancel(reason);
+            input(reason);
+          });
+        func1();
+        return result;
+      });
+      const f2 = flow(async () => {
+        await f1();
+        func2();
+      });
+
+      timeout(() => {
+        cancel(f2, '123');
+      }, 5);
+      await f2();
+      expect(input).lastCalledWith('123');
+      expect(func1).not.toBeCalled();
+      expect(func2).not.toBeCalled();
+      verify();
+      await delay(60);
+      expect(__debug_live_threads.length).toBe(0);
+    });
+  });
+
+  describe('mobx', () => {
+    mobxConfigure({
+      enforceActions: 'always',
+      computedRequiresReaction: true,
+      reactionRequiresObservable: true,
+      // observableRequiresReaction: true,
+      // disableErrorBoundaries: true,
+    });
+
+    class MobxPlugin implements Plugin {
+      currInfo: IActionRunInfo | undefined = undefined;
+      onState(state: TraceState, thread: Thread) {
+        const { parent, name } = thread;
+        if (state === TraceState.thread_start) {
+          if (action && parent && parent.level > 0) {
+            this.endAction(this.currInfo);
+          }
+
+          if (action && thread.level > 0) {
+            this.currInfo = _startAction(
+              name ? name : 'unknow',
+              false,
+              undefined
+            );
+          }
+        } else if (state === TraceState.thread_completed) {
+          if (action && thread.level > 0) {
+            this.endAction(this.currInfo);
+          }
+
+          if (action && parent && !parent.hasChildren) {
+            const { name } = parent;
+            this.currInfo = this.startAction(
+              name ? name : 'unknow',
+              false,
+              undefined
+            );
+          }
+        }
+      }
+      startAction(...args: Parameters<typeof _startAction>) {
+        return _startAction(...args);
+      }
+      endAction(runInfo?: IActionRunInfo) {
+        if (!runInfo)
+          throw new Error(
+            '[mobx-safe-flow] The mobx-plugin may be enabled in the wrong order.'
+          );
+        _endAction(runInfo);
+      }
+    }
+    const plugin = new MobxPlugin();
+    beforeAll(() => {
+      plugins.add(plugin);
+    });
+    afterAll(() => {
+      plugins.remove(plugin);
+    });
+
+    it('asynchronous actions', async () => {
+      {
+        class Doubler {
+          value = 1;
+          constructor() {
+            flowup(this, { names: { increment: true } });
+            makeObservable(this, {
+              value: observable,
+              double: computed,
+              increment: action,
+            });
+          }
+          get double() {
+            return this.value * 2;
+          }
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = new Doubler();
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+
+      {
+        class Doubler {
+          value = 1;
+          constructor() {
+            makeAutoObservable(this);
+            flowup(this, { names: { increment: true } });
+          }
+          get double() {
+            return this.value * 2;
+          }
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = new Doubler();
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+
+      {
+        class Doubler {
+          value = 1;
+          get double() {
+            return this.value * 2;
+          }
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = new Doubler();
+
+        makeObservable(doubler, {
+          value: observable,
+          double: computed,
+          increment: action,
+        });
+        flowup(doubler, { names: { increment: true } });
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+
+      {
+        class Doubler {
+          value = 1;
+          get double() {
+            return this.value * 2;
+          }
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = new Doubler();
+
+        flowup(doubler, { names: { increment: true } });
+        makeAutoObservable(doubler);
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+
+      {
+        class Doubler {
+          value = 1;
+          constructor() {
+            makeAutoObservable(this);
+          }
+          get double() {
+            return this.value * 2;
+          }
+          @flowable
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = flowup(new Doubler());
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+
+      {
+        class Doubler {
+          value = 1;
+          constructor() {
+            flowup(this);
+          }
+          get double() {
+            return this.value * 2;
+          }
+          @flowable
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+        }
+        const doubler = new Doubler();
+
+        makeObservable(doubler, {
+          value: observable,
+          double: computed,
+          increment: action,
+        });
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.increment();
+        expect(view1).toBeCalledTimes(4);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(4);
+        expect(doubler.double).toBe(8);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+    });
+
+    it('asynchronous parallel actions', async () => {
+      {
+        class Doubler {
+          value = 1;
+          constructor() {
+            flowup(this);
+          }
+          get double() {
+            return this.value * 2;
+          }
+          @flowable
+          async increment() {
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+            await flow(delay)(10);
+            this.value++;
+          }
+
+          @flowable
+          async test() {
+            this.value++;
+            await Promise.all([flow(delay)(10), this.increment()]);
+            this.value++;
+          }
+        }
+        const doubler = makeAutoObservable(new Doubler());
+
+        const view1 = jest.fn(() => {
+          return `btn:${doubler.double}`;
+        });
+        autorun(view1);
+
+        expect(view1).toBeCalledTimes(1);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        await doubler.test();
+        expect(view1).toBeCalledTimes(5);
+        expect(view1).lastReturnedWith(`btn:${doubler.double}`);
+        expect(doubler.value).toBe(6);
+        expect(doubler.double).toBe(12);
+        verify();
+        expect(__debug_live_threads.length).toBe(0);
+      }
+    });
+  });
+
+  it('plugin', async () => {
+    const plugin: Plugin = {
+      onState: () => {
+        //
+      },
+    };
+    plugins.add(plugin);
+    expect(() => plugins.add(plugin)).toThrowError(
+      '[safe-flow] This plugin has been added.'
+    );
+    plugins.remove(plugin);
+    expect(() => plugins.remove(plugin)).toThrowError(
+      '[safe-flow] Cannot remove unadded plugin.'
+    );
+  });
+
+  it('onState', async () => {
+    const onState = jest.fn((state: TraceState) => state);
+    const f1 = flow(response, { onState });
+    await f1('foo');
+    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_done);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
   it('errf', async () => {
     class Store {
       @flowable
@@ -89,11 +667,11 @@ describe('safe-flow', () => {
       }
 
       foo2 = flow(async (t: number) => {
-        return await flow(fetch)(t.toString());
+        return await flow(response)(t.toString());
       });
 
       foo3 = flow(async (t: number) => {
-        return await flow(fetch)(t.toString()).errf();
+        return await flow(response)(t.toString()).errf();
       });
 
       foo4 = flow(async (t: number) => {
@@ -158,6 +736,74 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
+  it('try/catch and .catch() on the child thread', async () => {
+    const input = jest.fn();
+    const func = jest.fn();
+    class Store {
+      @flowable({ token: 'token' })
+      async foo1() {
+        await flow(response)(1).catch((error) => {
+          input(error);
+        });
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo2() {
+        await flow(response)(1).catch((error) => {
+          input(error);
+        });
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo3() {
+        try {
+          await Promise.all([
+            flow(response)(1),
+            flow(response)(2),
+            flow(response)(3),
+          ]);
+        } catch (error) {
+          input(error);
+        }
+        func();
+      }
+
+      @flowable({ token: 'token' })
+      async foo4() {
+        await Promise.all([
+          flow(response)(1),
+          flow(response)(2),
+          flow(response)(3),
+        ]).catch((error) => {
+          input(error);
+        });
+        func();
+      }
+    }
+    const store = flowup(new Store());
+
+    const flows = [store.foo1, store.foo2, store.foo3, store.foo4];
+    for (let i = 0; i < flows.length; i++) {
+      input.mockClear();
+      func.mockClear();
+      timeout(() => {
+        cancel('token');
+      }, 5);
+      await flow(async () => {
+        await flows[i]();
+      })();
+      expect(input).toBeCalledWith(
+        '[safe-flow] Do not use try/catch and .catch() on threads. This will cause the parent thread to fail to interrupt when it is cancelled. Use .errf() to receive exceptions instead.'
+      );
+      expect(func).toBeCalled();
+      verify();
+      await delay(10);
+      expect(__debug_live_threads.length).toBe(0);
+    }
+  });
+
   describe('Cancel immediately cancel after the main thread starts', () => {
     immediately_after_the_main_thread_starts(CancelMethod.cancelSelf);
     immediately_after_the_main_thread_starts(CancelMethod.cancelToken);
@@ -180,69 +826,92 @@ describe('safe-flow', () => {
   });
 
   it('flowup', async () => {
-    class Store {
-      foo1() {
-        return flow(fetch)('foo1');
-      }
-      foo2() {
-        return flow(fetch)('foo2');
-      }
+    {
+      class Store {
+        foo1() {
+          return flow(response)('foo1');
+        }
+        foo2() {
+          return flow(response)('foo2');
+        }
 
-      @flowable
-      async foo3() {
-        await flow(delay)(5);
-        return await flow(fetch)('foo3');
+        @flowable
+        async foo3() {
+          await flow(delay)(5);
+          return await flow(response)('foo3');
+        }
+
+        @flowable({ standalone: true })
+        async foo4() {
+          await flow(delay)(5);
+          return await flow(response)('foo4');
+        }
+
+        @flowable
+        async foo5() {
+          await flow(delay)(5);
+          return await flow(response)('foo5');
+        }
+
+        async foo6() {
+          await flow(delay)(5);
+          return await flow(response)('foo6');
+        }
       }
-
-      @flowable({ standalone: true })
-      async foo4() {
-        await flow(delay)(5);
-        return await flow(fetch)('foo4');
-      }
-
-      @flowable
-      async foo5() {
-        await flow(delay)(5);
-        return await flow(fetch)('foo5');
-      }
-
-      async foo6() {
-        await flow(delay)(5);
-        return await flow(fetch)('foo6');
-      }
-    }
-    const store = new Store();
-    flowup(store, {
-      names: { foo1: true, foo5: true },
-      filter: (name) => name === 'foo2' || name === 'foo5',
-    });
-
-    expect(store.foo1.name.includes('safe_flow_creator')).toBeTruthy();
-    expect(store.foo2.name.includes('safe_flow_creator')).toBeTruthy();
-    expect(store.foo3.name.includes('safe_flow_creator')).toBeTruthy();
-    expect(store.foo4.name.includes('safe_flow_creator')).toBeTruthy();
-    expect(store.foo5.name.includes('safe_flow_creator')).toBeTruthy();
-    expect(store.foo6.name).toBe('foo6');
-    expect(await store.foo1()).toEqual([null, [null, 'foo1']]);
-    expect(await store.foo2()).toEqual([null, [null, 'foo2']]);
-    expect(await store.foo3()).toEqual([null, [null, 'foo3']]);
-    expect(await store.foo4()).toEqual([null, [null, 'foo4']]);
-    expect(await store.foo5()).toEqual([null, [null, 'foo5']]);
-    expect(await store.foo6()).toEqual([null, 'foo6']);
-    verify();
-    expect(__debug_live_threads.length).toBe(0);
-
-    expect(() => {
+      const store = new Store();
       flowup(store, {
-        names: {
-          foo7: true,
-        },
+        names: { foo1: true, foo5: true },
+        filter: (name) => name === 'foo2' || name === 'foo5',
       });
-    }).toThrow(
-      new ReferenceError(
-        '[safe-flow] The specified attribute "foo7" found through the names option is not a function.'
-      )
-    );
+
+      expect(store.foo1.name.includes('safe_flow_creator')).toBeTruthy();
+      expect(store.foo2.name.includes('safe_flow_creator')).toBeTruthy();
+      expect(store.foo3.name.includes('safe_flow_creator')).toBeTruthy();
+      expect(store.foo4.name.includes('safe_flow_creator')).toBeTruthy();
+      expect(store.foo5.name.includes('safe_flow_creator')).toBeTruthy();
+      expect(store.foo6.name).toBe('foo6');
+      expect(await store.foo1()).toEqual([null, [null, 'foo1']]);
+      expect(await store.foo2()).toEqual([null, [null, 'foo2']]);
+      expect(await store.foo3()).toEqual([null, [null, 'foo3']]);
+      expect(await store.foo4()).toEqual([null, [null, 'foo4']]);
+      expect(await store.foo5()).toEqual([null, [null, 'foo5']]);
+      expect(await store.foo6()).toEqual([null, 'foo6']);
+      verify();
+      expect(__debug_live_threads.length).toBe(0);
+
+      expect(() => {
+        flowup(store, {
+          names: {
+            foo7: true,
+          },
+        });
+      }).toThrow(
+        new Error(
+          '[safe-flow] flowup can only be used on objects that have not yet flowup.'
+        )
+      );
+    }
+
+    {
+      class Store {
+        foo1() {
+          return flow(response)('foo1');
+        }
+      }
+      const store = new Store();
+
+      expect(() => {
+        flowup(store, {
+          names: {
+            foo2: true,
+          },
+        });
+      }).toThrow(
+        new ReferenceError(
+          '[safe-flow] The specified attribute "foo2" found through the names option is not a function.'
+        )
+      );
+    }
   });
 
   describe('complete a thread', () => {
@@ -250,82 +919,19 @@ describe('safe-flow', () => {
     complete_a_thread_return_values();
   });
 
-  it('try/catch and .catch() on the child thread', async () => {
-    const func = jest.fn();
-    let breakMsg = '';
-    class Store {
-      @flowable({ token: 'token' })
-      async foo1() {
-        try {
-          await flow(fetch)(1);
-        } catch (error) {
-          breakMsg = error;
-        }
-        func();
-      }
-
-      @flowable({ token: 'token' })
-      async foo2() {
-        await flow(fetch)(1).catch((error) => {
-          breakMsg = error;
-        });
-        func();
-      }
-
-      @flowable({ token: 'token' })
-      async foo3() {
-        try {
-          await Promise.all([flow(fetch)(1), flow(fetch)(2), flow(fetch)(3)]);
-        } catch (error) {
-          breakMsg = error;
-        }
-        func();
-      }
-
-      @flowable({ token: 'token' })
-      async foo4() {
-        await Promise.all([
-          flow(fetch)(1),
-          flow(fetch)(2),
-          flow(fetch)(3),
-        ]).catch((error) => {
-          breakMsg = error;
-        });
-        func();
-      }
-    }
-    const store = flowup(new Store());
-
-    const flows = [store.foo1];
-    for (let i = 0; i < flows.length; i++) {
-      timeout(() => {
-        cancel('token');
-      }, 5);
-      await flow(async () => {
-        await flows[i]();
-      })();
-      expect(breakMsg).toBe(
-        '[safe-flow] Do not use try/catch and .catch() on threads. It causes the parent thread to not be interrupted as expected when cancelled. Use .errf() to receive exceptions instead.'
-      );
-      expect(func).toBeCalled();
-      verify();
-      expect(__debug_live_threads.length).toBe(0);
-    }
-  });
-
-  it('use flowup names to set name', async () => {
+  it('use flowup names to set options', async () => {
     configure({ trace: true });
     class Store {
       foo1() {
-        return flow(fetch)('foo1');
+        return flow(response)('foo1');
       }
       foo2() {
-        return flow(fetch)('foo1');
+        return flow(response)('foo1');
       }
     }
     const store = new Store();
     flowup(store, {
-      names: { foo1: true, foo2: 'fooooo2' },
+      names: { foo1: true, foo2: { name: 'fooooo2' } },
     });
 
     expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
@@ -334,17 +940,17 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('also set options in flowup names and flowable', async () => {
+  it('set options of flowup names and @flowable in simultaneously', async () => {
     configure({ trace: true });
     class Store {
       @flowable({ name: 'nameFlowable', token: 'tokenFlowable' })
       foo1() {
-        return flow(fetch)('foo1');
+        return flow(response)('foo1');
       }
     }
     const store = new Store();
     flowup(store, {
-      names: { foo1: 'nameFlowup' },
+      names: { foo1: { name: 'nameFlowup' } },
       token: 'tokenFlowup',
     });
 
@@ -364,7 +970,7 @@ describe('safe-flow', () => {
     };
     flowable(foo1, 'f1');
     //@ts-expect-error
-    expect(foo1.f1.__safe_flow_flowable).toBeTruthy();
+    expect(foo1.__safe_flow_flowable['f1']).toBeTruthy();
 
     const foo2 = {
       f2: async () => {
@@ -373,7 +979,7 @@ describe('safe-flow', () => {
     };
     flowable({})(foo2, 'f2');
     //@ts-expect-error
-    expect(foo2.f2.__safe_flow_flowable).toBeTruthy();
+    expect(foo2.__safe_flow_flowable['f2']).toBeTruthy();
   });
 
   it('standalone', async () => {
@@ -431,6 +1037,7 @@ describe('safe-flow', () => {
     const [, canceled] = await flowed(store.foo)(10).errf();
     expect(func).toBeCalledTimes(1);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
     expect(canceled).toBeInstanceOf(Canceled);
     if (canceled) {
@@ -478,9 +1085,9 @@ describe('safe-flow', () => {
       @flowable
       async foo() {
         await Promise.all([
-          flow(fetch, { token: 'token' })(1),
-          flow(fetch, { token: 'token' })(2),
-          flow(fetch, { token: 'token' })(3),
+          flow(response, { token: 'token' })(1),
+          flow(response, { token: 'token' })(2),
+          flow(response, { token: 'token' })(3),
         ]);
         return 'foo';
       }
@@ -493,10 +1100,7 @@ describe('safe-flow', () => {
     }, 5);
     await store.foo();
     verify();
-    expect(__debug_live_threads.length).toBe(0);
-
     await delay(10);
-    verify();
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -504,7 +1108,7 @@ describe('safe-flow', () => {
     cancel('unused token');
 
     const f1 = flow(async () => {
-      return await flow(fetch)('foo1');
+      return await flow(response)('foo1');
     });
     cancel(f1);
     verify();
@@ -595,6 +1199,7 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     timeout(() => cancel('token'), ms);
@@ -610,6 +1215,7 @@ describe('safe-flow', () => {
       FR.fulfilled,
     ]);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     timeout(() => cancelAll(), ms);
@@ -625,6 +1231,7 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -649,6 +1256,7 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     timeout(() => cancelAll(), 5);
@@ -658,6 +1266,7 @@ describe('safe-flow', () => {
       FR.canceled,
     ]);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -698,6 +1307,7 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(0);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     func.mockClear();
@@ -708,6 +1318,7 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(2);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     func.mockClear();
@@ -718,6 +1329,7 @@ describe('safe-flow', () => {
     ]);
     expect(func).toBeCalledTimes(2);
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -735,6 +1347,7 @@ describe('safe-flow', () => {
     let [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     timeout(() => {
@@ -743,6 +1356,7 @@ describe('safe-flow', () => {
     [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     timeout(() => {
@@ -751,6 +1365,7 @@ describe('safe-flow', () => {
     [canceled] = await f1();
     if (canceled) expect(canceled.reason).toBe('foo');
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -776,6 +1391,7 @@ describe('safe-flow', () => {
     expect(canceled).toBeInstanceOf(Canceled);
     expect(func).not.toBeCalled();
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
 
     func.mockClear();
@@ -793,6 +1409,7 @@ describe('safe-flow', () => {
     if (canceled) expect(canceled.reason).toBe('stop');
     expect(func).not.toBeCalled();
     verify();
+    await delay(10);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -801,7 +1418,7 @@ describe('safe-flow', () => {
 
     const f1 = flow(
       async () => {
-        await flow(fetch)('123');
+        await flow(response)('123');
         func();
       },
       { token: 'token' }
@@ -811,6 +1428,7 @@ describe('safe-flow', () => {
       const promise = f1();
       await promise;
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
       expect(promise.state()).toBe(PromiseState.fulfilled);
 
@@ -827,6 +1445,7 @@ describe('safe-flow', () => {
       const promise = f1();
       await promise;
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
       expect(() => promise.cancel('stop')).toThrowError(
         '[safe-flow] Unable to cancel a thread that has ended.'
@@ -844,6 +1463,7 @@ describe('safe-flow', () => {
       if (canceled) expect(canceled.reason).toBe('stop');
       expect(func).not.toBeCalled();
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
       expect(() => promise.cancel('stop')).toThrowError(
         '[safe-flow] Unable to cancel a thread that has ended.'
@@ -857,7 +1477,7 @@ describe('safe-flow', () => {
     class Store {
       @flowable
       async foo1() {
-        const foo2 = flow(fetch, { token: 'foo2' });
+        const foo2 = flow(response, { token: 'foo2' });
         foo2('foo2').errf();
         foo2('foo2').errf();
         await foo2('foo2').errf();
@@ -881,7 +1501,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           foo2('foo2').errf();
           foo2('foo2').errf();
           foo2('foo2').errf();
@@ -903,7 +1523,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           foo2('foo2').errf();
           cancelSelf();
           func();
@@ -924,7 +1544,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
           cancel(this);
           func();
@@ -945,7 +1565,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           foo2('foo2');
           cancel(foo2);
           func();
@@ -966,7 +1586,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
           cancelAll();
           func();
@@ -987,7 +1607,7 @@ describe('safe-flow', () => {
       class Store {
         @flowable
         async foo1() {
-          const foo2 = flow(fetch, { token: 'foo2' });
+          const foo2 = flow(response, { token: 'foo2' });
           await foo2('foo2');
           foo2('foo2');
           cancel('foo2');
@@ -1189,7 +1809,8 @@ describe('safe-flow', () => {
       ++i,
       '[safe-flow] [foo1](1): error Error: Error occurred!'
     );
-    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Clear the current thread pointer.'
@@ -1197,7 +1818,7 @@ describe('safe-flow', () => {
     expect(log).toBeCalledTimes(i);
   });
 
-  it('error in Parallel threads', async () => {
+  it('error in parallel threads', async () => {
     const func = jest.fn();
     let i = 0;
     const f1 = flow(async () => {
@@ -1214,6 +1835,25 @@ describe('safe-flow', () => {
       errfSimplify(await Promise.all([f1().errf(), f1().errf(), f2().errf()]))
     ).toEqual([EFR.fulfilled, EFR.error, EFR.fulfilled]);
     expect(func).toBeCalledTimes(2);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('promise.errf()/promise.onCancel() can only be called once', async () => {
+    const f1 = flow(async () => {
+      return 'foo';
+    });
+
+    //@ts-expect-error
+    expect(() => f1().errf().errf()).toThrowError(
+      'f1(...).errf(...).errf is not a function'
+    );
+    //@ts-expect-error
+    expect(() => f1().onCancel().onCancel()).toThrowError(
+      'f1(...).onCancel(...).onCancel is not a function'
+    );
+
+    await delay(5);
     verify();
     expect(__debug_live_threads.length).toBe(0);
   });
@@ -1250,7 +1890,7 @@ describe('safe-flow', () => {
 
   it('isSafeFlowPromise', async () => {
     const f1 = flow(async () => {
-      await flow(fetch)(1);
+      await flow(response)(1);
     });
 
     {
@@ -1271,7 +1911,7 @@ describe('safe-flow', () => {
 
   it('canceled value of safe flow romise', async () => {
     const f1 = flow(async () => {
-      await flow(fetch)(1);
+      await flow(response)(1);
     });
 
     {
@@ -1301,11 +1941,11 @@ describe('safe-flow', () => {
       }
 
       foo2 = flow(async (t: number) => {
-        return await flow(fetch)(t.toString());
+        return await flow(response)(t.toString());
       });
 
       foo3 = flow(async (t: number) => {
-        return await flow(fetch)(t.toString()).errf();
+        return await flow(response)(t.toString()).errf();
       });
     }
     const store = flowup(new Store());
@@ -1377,11 +2017,13 @@ describe('safe-flow', () => {
 
     await f4();
     verify();
-    expect(__debug_live_threads.length).toBe(0);
     expect(func).toBeCalledTimes(2);
     expect(func1).not.toBeCalled();
     expect(func2).not.toBeCalled();
     expect(func3).not.toBeCalled();
+
+    await delay(50);
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   it('custom trace', async () => {
@@ -1396,7 +2038,7 @@ describe('safe-flow', () => {
     class Store {
       @flowable({ name: 'foo1' })
       async foo1() {
-        await flow(fetch, { name: 'foo2' })('foo1');
+        await flow(response, { name: 'foo2' })('foo1');
         cancelSelf();
       }
     }
@@ -1425,13 +2067,15 @@ describe('safe-flow', () => {
       ++i,
       '[safe-flow] Clear the current thread pointer.'
     );
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_done);
     expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_completed);
-    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_terminated);
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_disposed);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Change the current thread pointer to [foo1].'
     );
     expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_canceled);
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_completed);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Clear the current thread pointer.'
@@ -1439,12 +2083,8 @@ describe('safe-flow', () => {
     expect(log).toBeCalledTimes(i);
 
     await delay(10);
-    expect(log).nthCalledWith(
-      ++i,
-      'foo1',
-      TraceState.thread_completed_canceled
-    );
-    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_terminated);
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_done_canceled);
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_disposed);
     expect(log).toBeCalledTimes(i);
     verify();
     expect(__debug_live_threads.length).toBe(0);
@@ -1458,7 +2098,7 @@ describe('safe-flow', () => {
 
   it('Turn off debug enable', async () => {
     __debug_enable(false);
-    const [, done] = await flow(fetch)(1);
+    const [, done] = await flow(response)(1);
     expect(done).toBe(1);
     verify();
     expect(__debug_live_threads.length).toBe(0);
@@ -1520,6 +2160,7 @@ describe('safe-flow', () => {
       expect(func).toBeCalledTimes(0);
 
       if (!isTrace) {
+        await delay(10);
         expect(__debug_live_threads.length).toBe(0);
         return;
       }
@@ -1531,6 +2172,7 @@ describe('safe-flow', () => {
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
       expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled stop');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -1538,13 +2180,11 @@ describe('safe-flow', () => {
       expect(log).toBeCalledTimes(i);
       expect(__debug_live_threads.length).toBe(1);
       await delay(10);
-      expect(log).nthCalledWith(
-        ++i,
-        '[safe-flow] [foo1](1): completed (canceled)'
-      );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done (canceled)');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
       expect(log).toBeCalledTimes(i);
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     });
   }
@@ -1576,7 +2216,7 @@ describe('safe-flow', () => {
 
       const foo1 = flow(
         async (t: number) => {
-          await flow(fetch, { name: 'foo2' })('123');
+          await flow(response, { name: 'foo2' })('123');
           switch (method) {
             case CancelMethod.cancelSelf:
               cancelSelf('stop');
@@ -1606,6 +2246,7 @@ describe('safe-flow', () => {
       expect(func).toBeCalledTimes(0);
 
       if (!isTrace) {
+        await delay(10);
         expect(__debug_live_threads.length).toBe(0);
         return;
       }
@@ -1630,13 +2271,15 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Clear the current thread pointer.'
       );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): completed 123');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): done 123');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): completed');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): disposed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
       expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled stop');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -1644,13 +2287,11 @@ describe('safe-flow', () => {
       expect(log).toBeCalledTimes(i);
       expect(__debug_live_threads.length).toBe(1);
       await delay(10);
-      expect(log).nthCalledWith(
-        ++i,
-        '[safe-flow] [foo1](1): completed (canceled)'
-      );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done (canceled)');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
       expect(log).toBeCalledTimes(i);
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     });
   }
@@ -1679,7 +2320,7 @@ describe('safe-flow', () => {
 
       const foo1 = flow(
         async (t: number) => {
-          await flow(fetch, { name: 'foo2' })('123');
+          await flow(response, { name: 'foo2' })('123');
           func();
           return t.toString();
         },
@@ -1712,6 +2353,7 @@ describe('safe-flow', () => {
       expect(func).toBeCalledTimes(0);
 
       if (!isTrace) {
+        await delay(10);
         expect(__debug_live_threads.length).toBe(0);
         return;
       }
@@ -1737,31 +2379,31 @@ describe('safe-flow', () => {
         '[safe-flow] Clear the current thread pointer.'
       );
       expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): canceled');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): completed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
       expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
       );
       expect(__debug_live_threads.length).toBe(2);
       await delay(1);
-      expect(log).nthCalledWith(
-        ++i,
-        '[safe-flow] [foo1](1): completed (canceled)'
-      );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done (canceled)');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
       expect(__debug_live_threads.length).toBe(1);
       await delay(10);
       expect(log).nthCalledWith(
         ++i,
-        '[safe-flow] [foo2](1): completed (canceled) 123'
+        '[safe-flow] [foo2](1): done (canceled) 123'
       );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): disposed');
       expect(log).toBeCalledTimes(i);
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     });
   }
@@ -1794,8 +2436,9 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Clear the current thread pointer.'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done');
       expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -1813,13 +2456,14 @@ describe('safe-flow', () => {
       // print = true;
       configure({ trace: isTrace });
 
-      const foo1 = flow(fetch, { name: 'foo1' });
+      const foo1 = flow(response, { name: 'foo1' });
       const [, done] = await foo1('123', 5);
       expect(done).toBe('123');
       verify();
       expect(__debug_live_threads.length).toBe(0);
 
       if (!isTrace) {
+        await delay(10);
         expect(__debug_live_threads.length).toBe(0);
         return;
       }
@@ -1834,14 +2478,16 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Clear the current thread pointer.'
       );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed 123');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): terminated');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done 123');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
       );
       expect(log).toBeCalledTimes(i);
       verify();
+      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     });
   }
