@@ -188,7 +188,7 @@ export class Thread {
       this.promiseState = PromiseState.rejected;
     }
 
-    plugins.onState(state, this);
+    if (!this.disposed) plugins.onState(state, this);
     if (this.plugins)
       this.plugins.forEach((plugin) => {
         plugin.onState(state, this);
@@ -265,6 +265,7 @@ export class Thread {
     this.canceler = undefined;
     this.cancellation = undefined;
     this.onState = undefined;
+    this.plugins = undefined;
 
     this.children.length = 0;
     //@ts-expect-error

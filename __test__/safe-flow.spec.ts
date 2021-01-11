@@ -586,7 +586,7 @@ describe('safe-flow', () => {
     });
   });
 
-  it('plugin', async () => {
+  it('add plugin to plugins', async () => {
     const onState = jest.fn((state: TraceState) => state);
     const plugin: Plugin = {
       onState,
@@ -598,12 +598,13 @@ describe('safe-flow', () => {
 
     const f1 = flow(response);
     await f1('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
     expect(onState).nthReturnedWith(++i, TraceState.thread_start);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
-    verify();
-    expect(__debug_live_threads.length).toBe(0);
+    expect(onState).toBeCalledTimes(i);
 
     plugins.remove(plugin);
     expect(() => plugins.remove(plugin)).toThrowError(
@@ -611,16 +612,50 @@ describe('safe-flow', () => {
     );
   });
 
-  it('onState', async () => {
+  it('set plugins in options', async () => {
     const onState = jest.fn((state: TraceState) => state);
-    const f1 = flow(response, { onState });
+    const plugin: Plugin = {
+      onState,
+    };
+
+    const f1 = flow(response, { plugins: [plugin] });
     await f1('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
     expect(onState).nthReturnedWith(++i, TraceState.thread_start);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
+    expect(onState).toBeCalledTimes(i);
+
+    class Store {
+      @flowable
+      async foo1() {
+        return flow(response)('foo');
+      }
+    }
+    const store = flowup(new Store(), { plugins: [plugin] });
+    await store.foo1();
     verify();
     expect(__debug_live_threads.length).toBe(0);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_done);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
+    expect(onState).toBeCalledTimes(i);
+  });
+
+  it('onState', async () => {
+    const onState = jest.fn((state: TraceState) => state);
+    const f1 = flow(response, { onState });
+    await f1('foo');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_done);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
+    expect(onState).toBeCalledTimes(i);
   });
 
   it('errf', async () => {

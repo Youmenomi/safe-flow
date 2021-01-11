@@ -27,7 +27,7 @@ export default [].concat(
     {
       file: `dist/umd/${pkg.name}.umd.js`,
       format: 'umd',
-      name: 'safe-flow',
+      name: 'safeFlow',
     },
     { withMin: true }
   )
