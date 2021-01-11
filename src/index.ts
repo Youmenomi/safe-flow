@@ -24,16 +24,13 @@ class Plugins {
 export const plugins = new Plugins();
 
 export type FlowOptions = {
-  token?: any;
-  trace?: boolean | Trace;
   name?: string;
-  standalone?: boolean;
-  onState?: StateHandler;
-};
+} & Omit<FlowupOptions, 'filter' | 'names'>;
 
 export type FlowupOptions = {
   token?: any;
   names?: { [key: string]: true | FlowOptions };
+  plugins?: Plugin[];
 } & Config;
 
 export type FlowResult<
@@ -151,9 +148,9 @@ export class Thread {
   }
 
   _level = -1;
-  get level() {
-    return this._level;
-  }
+  // get level() {
+  //   return this._level;
+  // }
   levelup() {
     this._level++;
   }
@@ -166,13 +163,15 @@ export class Thread {
     public trace: boolean | Trace,
     public name?: string,
     public id?: number,
-    public onState?: StateHandler
+    public onState?: StateHandler,
+    public plugins?: Plugin[]
   ) {
     this.levelup();
     if (__debug_enable_value) __debug_live_threads.push(this);
   }
 
   changeState(state: TraceState.thread_start): void;
+  changeState(state: TraceState.thread_idle): void;
   changeState(state: TraceState.thread_canceled, reason: unknown): void;
   changeState(state: TraceState.thread_error, error: unknown): void;
   changeState(state: TraceState.thread_done, value: unknown): void;
@@ -190,11 +189,20 @@ export class Thread {
     }
 
     plugins.onState(state, this);
+    if (this.plugins)
+      this.plugins.forEach((plugin) => {
+        plugin.onState(state, this);
+      });
     if (this.onState) this.onState(state, this);
 
     if (this.trace && this.name) {
       /* istanbul ignore else */
-      if (state === TraceState.thread_start) {
+      if (
+        state === TraceState.thread_start ||
+        state === TraceState.thread_idle ||
+        state === TraceState.thread_completed ||
+        state === TraceState.thread_disposed
+      ) {
         tracing(this.trace, { state, name: this.name, id: this.id });
       } else if (state === TraceState.thread_canceled) {
         tracing(this.trace, {
@@ -217,24 +225,12 @@ export class Thread {
           id: this.id,
           value: args[0],
         });
-      } else if (state === TraceState.thread_completed) {
-        tracing(this.trace, {
-          state,
-          name: this.name,
-          id: this.id,
-        });
       } else if (state === TraceState.thread_done_canceled) {
         tracing(this.trace, {
           state,
           name: this.name,
           id: this.id,
           value: args[0],
-        });
-      } else if (state === TraceState.thread_disposed) {
-        tracing(this.trace, {
-          state,
-          name: this.name,
-          id: this.id,
         });
       } else {
         throw report();
@@ -382,6 +378,7 @@ export const __debug_live_threads: Thread[] = [];
 export enum TraceState {
   creator_created,
   thread_start,
+  thread_idle,
   thread_canceled,
   thread_error,
   thread_done,
@@ -424,6 +421,7 @@ export type TraceEvent =
       id?: number;
       state:
         | TraceState.thread_start
+        | TraceState.thread_idle
         | TraceState.thread_completed
         | TraceState.thread_disposed;
     };
@@ -446,6 +444,9 @@ const defTrace: Trace = (event) => {
     switch (state) {
       case TraceState.thread_start:
         status = 'start';
+        break;
+      case TraceState.thread_idle:
+        status = 'idle';
         break;
       case TraceState.thread_completed:
         status = 'completed';
@@ -498,7 +499,7 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
 ): SafeFlowCreator<TReturn, ThisParameterType<typeof func>, TParam> {
   const opts = defaults(options, config);
   let { token } = opts;
-  const { trace, name, standalone, onState } = opts;
+  const { trace, name, standalone, onState, plugins } = opts;
   if (trace && name) {
     registerName(name);
     tracing(trace, { name, state: TraceState.creator_created });
@@ -540,16 +541,16 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
       trace,
       name,
       id,
-      onState
+      onState,
+      plugins
     );
     process.push(thread);
     thread.changeState(TraceState.thread_start);
+    setCurrThread(thread);
 
     let cancelHandler: undefined | CancelHandler = undefined;
     let errfPromise: undefined | any = undefined;
     const promise = new Promise((resolve, reject) => {
-      setCurrThread(thread);
-
       thread.canceler = (reason, isThrow = false, batching = true) => {
         cancelChildren(thread, reason, true);
         if (parentThread) {
@@ -621,7 +622,10 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
           throw report();
         }
       });
-      if (!thread.canceled) setCurrThread(parentThread);
+      if (!thread.canceled) {
+        thread.changeState(TraceState.thread_idle);
+        setCurrThread(parentThread);
+      }
     }) as ReturnType<SafeFlowCreator<TReturn, TThis, TParam>>;
 
     promise.safe_flow_promise = true;
@@ -869,7 +873,7 @@ function flowupProp(
     } else return;
   }
 
-  const { names, token, trace, standalone } = options;
+  const { names, token, trace, standalone, plugins } = options;
   let name: string | undefined;
   if (trace && names) {
     /* istanbul ignore else */
@@ -886,6 +890,7 @@ function flowupProp(
     trace,
     name,
     standalone,
+    plugins,
   };
 
   if (typeof isFlowable === 'object') {

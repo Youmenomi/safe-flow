@@ -17,7 +17,6 @@ import {
   TraceState,
   __debug_clear_threads,
   isSafeFlowPromise,
-  Thread,
   plugins,
   Plugin,
 } from '../src';
@@ -32,16 +31,15 @@ import {
   simplify,
   timeout,
   verify,
+  xflowup,
+  xflow,
 } from './helper';
 import {
   computed,
   configure as mobxConfigure,
   makeObservable,
   observable,
-  _startAction,
-  _endAction,
   autorun,
-  IActionRunInfo,
   makeAutoObservable,
   action,
 } from 'mobx';
@@ -51,6 +49,14 @@ import fetchMock from 'fetch-mock';
 import 'cross-fetch/polyfill';
 
 __debug_enable(true);
+
+mobxConfigure({
+  enforceActions: 'always',
+  computedRequiresReaction: true,
+  reactionRequiresObservable: true,
+  // observableRequiresReaction: true,
+  // disableErrorBoundaries: true,
+});
 
 enum CancelMethod {
   cancelSelf,
@@ -297,70 +303,12 @@ describe('safe-flow', () => {
   });
 
   describe('mobx', () => {
-    mobxConfigure({
-      enforceActions: 'always',
-      computedRequiresReaction: true,
-      reactionRequiresObservable: true,
-      // observableRequiresReaction: true,
-      // disableErrorBoundaries: true,
-    });
-
-    class MobxPlugin implements Plugin {
-      currInfo: IActionRunInfo | undefined = undefined;
-      onState(state: TraceState, thread: Thread) {
-        const { parent, name } = thread;
-        if (state === TraceState.thread_start) {
-          if (action && parent && parent.level > 0) {
-            this.endAction(this.currInfo);
-          }
-
-          if (action && thread.level > 0) {
-            this.currInfo = _startAction(
-              name ? name : 'unknow',
-              false,
-              undefined
-            );
-          }
-        } else if (state === TraceState.thread_completed) {
-          if (action && thread.level > 0) {
-            this.endAction(this.currInfo);
-          }
-
-          if (action && parent && !parent.hasChildren) {
-            const { name } = parent;
-            this.currInfo = this.startAction(
-              name ? name : 'unknow',
-              false,
-              undefined
-            );
-          }
-        }
-      }
-      startAction(...args: Parameters<typeof _startAction>) {
-        return _startAction(...args);
-      }
-      endAction(runInfo?: IActionRunInfo) {
-        if (!runInfo)
-          throw new Error(
-            '[mobx-safe-flow] The mobx-plugin may be enabled in the wrong order.'
-          );
-        _endAction(runInfo);
-      }
-    }
-    const plugin = new MobxPlugin();
-    beforeAll(() => {
-      plugins.add(plugin);
-    });
-    afterAll(() => {
-      plugins.remove(plugin);
-    });
-
     it('asynchronous actions', async () => {
       {
         class Doubler {
           value = 1;
           constructor() {
-            flowup(this, { names: { increment: true } });
+            xflowup(this, { names: { increment: true } });
             makeObservable(this, {
               value: observable,
               double: computed,
@@ -372,9 +320,10 @@ describe('safe-flow', () => {
           }
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
@@ -388,7 +337,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -401,16 +350,17 @@ describe('safe-flow', () => {
           value = 1;
           constructor() {
             makeAutoObservable(this);
-            flowup(this, { names: { increment: true } });
+            xflowup(this, { names: { increment: true } });
           }
           get double() {
             return this.value * 2;
           }
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
@@ -424,7 +374,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -440,9 +390,10 @@ describe('safe-flow', () => {
           }
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
@@ -453,7 +404,7 @@ describe('safe-flow', () => {
           double: computed,
           increment: action,
         });
-        flowup(doubler, { names: { increment: true } });
+        xflowup(doubler, { names: { increment: true } });
 
         const view1 = jest.fn(() => {
           return `btn:${doubler.double}`;
@@ -463,7 +414,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -479,15 +430,16 @@ describe('safe-flow', () => {
           }
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
         const doubler = new Doubler();
 
-        flowup(doubler, { names: { increment: true } });
+        xflowup(doubler, { names: { increment: true } });
         makeAutoObservable(doubler);
 
         const view1 = jest.fn(() => {
@@ -498,7 +450,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -518,13 +470,14 @@ describe('safe-flow', () => {
           @flowable
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
-        const doubler = flowup(new Doubler());
+        const doubler = xflowup(new Doubler());
 
         const view1 = jest.fn(() => {
           return `btn:${doubler.double}`;
@@ -534,7 +487,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -546,7 +499,7 @@ describe('safe-flow', () => {
         class Doubler {
           value = 1;
           constructor() {
-            flowup(this);
+            xflowup(this);
           }
           get double() {
             return this.value * 2;
@@ -554,9 +507,10 @@ describe('safe-flow', () => {
           @flowable
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
         }
@@ -576,7 +530,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.increment();
-        expect(view1).toBeCalledTimes(4);
+        expect(view1).toBeCalledTimes(3);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(4);
         expect(doubler.double).toBe(8);
@@ -590,7 +544,7 @@ describe('safe-flow', () => {
         class Doubler {
           value = 1;
           constructor() {
-            flowup(this);
+            xflowup(this);
           }
           get double() {
             return this.value * 2;
@@ -598,16 +552,17 @@ describe('safe-flow', () => {
           @flowable
           async increment() {
             this.value++;
-            await flow(delay)(10);
-            this.value++;
-            await flow(delay)(10);
+            await xflow(async () => {
+              this.value++;
+            })();
+            await xflow(delay)(10);
             this.value++;
           }
 
           @flowable
           async test() {
             this.value++;
-            await Promise.all([flow(delay)(10), this.increment()]);
+            await Promise.all([xflow(delay)(10), this.increment()]);
             this.value++;
           }
         }
@@ -621,7 +576,7 @@ describe('safe-flow', () => {
         expect(view1).toBeCalledTimes(1);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         await doubler.test();
-        expect(view1).toBeCalledTimes(5);
+        expect(view1).toBeCalledTimes(4);
         expect(view1).lastReturnedWith(`btn:${doubler.double}`);
         expect(doubler.value).toBe(6);
         expect(doubler.double).toBe(12);
@@ -632,15 +587,24 @@ describe('safe-flow', () => {
   });
 
   it('plugin', async () => {
+    const onState = jest.fn((state: TraceState) => state);
     const plugin: Plugin = {
-      onState: () => {
-        //
-      },
+      onState,
     };
     plugins.add(plugin);
     expect(() => plugins.add(plugin)).toThrowError(
       '[safe-flow] This plugin has been added.'
     );
+
+    const f1 = flow(response);
+    await f1('foo');
+    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_done);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+
     plugins.remove(plugin);
     expect(() => plugins.remove(plugin)).toThrowError(
       '[safe-flow] Cannot remove unadded plugin.'
@@ -652,6 +616,7 @@ describe('safe-flow', () => {
     const f1 = flow(response, { onState });
     await f1('foo');
     expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
     verify();
@@ -1801,6 +1766,7 @@ describe('safe-flow', () => {
       ++i,
       '[safe-flow] Change the current thread pointer to [foo1].'
     );
+    expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): idle');
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Clear the current thread pointer.'
@@ -2059,10 +2025,12 @@ describe('safe-flow', () => {
       ++i,
       '[safe-flow] Change the current thread pointer to [foo2].'
     );
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_idle);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Change the current thread pointer to [foo1].'
     );
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_idle);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Clear the current thread pointer.'
@@ -2263,10 +2231,12 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Change the current thread pointer to [foo2].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -2370,10 +2340,12 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Change the current thread pointer to [foo2].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo2](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -2432,6 +2404,7 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
@@ -2474,6 +2447,7 @@ describe('safe-flow', () => {
         ++i,
         '[safe-flow] Change the current thread pointer to [foo1].'
       );
+      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): idle');
       expect(log).nthCalledWith(
         ++i,
         '[safe-flow] Clear the current thread pointer.'
