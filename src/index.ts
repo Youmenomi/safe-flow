@@ -49,72 +49,58 @@ export type SafeFlowCreator<
   TReturn = any,
   TThis = any,
   TParam extends any[] = any,
-  TErrf extends boolean = false,
-  TOnCancel extends boolean = false
+  TErrf extends boolean = false
 > = (
   ...args: TParam
 ) => Promise<FlowResult<TReturn, TThis, TParam, TErrf>> &
   (TErrf extends false
-    ? TOnCancel extends false
-      ? {
-          safe_flow_promise: true;
-          canceled: () => boolean;
-          cancel: (reason?: any) => void;
-          state: () => PromiseState;
-          errf: () => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, true>>;
-          onCancel: (
-            handler: CancelHandler
-          ) => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, false, true>>;
-        }
-      : {
-          safe_flow_promise: true;
-          canceled: () => boolean;
-          cancel: (reason?: any) => void;
-          state: () => PromiseState;
-          errf: () => ReturnType<
-            SafeFlowCreator<TReturn, TThis, TParam, true, true>
-          >;
-        }
-    : TOnCancel extends false
     ? {
         safe_flow_promise: true;
         canceled: () => boolean;
         cancel: (reason?: any) => void;
         state: () => PromiseState;
+        errf: () => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, true>>;
         onCancel: (
           handler: CancelHandler
-        ) => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, true, true>>;
+        ) => ReturnType<SafeFlowCreator<TReturn, TThis, TParam>>;
       }
     : {
         safe_flow_promise: true;
         canceled: () => boolean;
         cancel: (reason?: any) => void;
         state: () => PromiseState;
+        onCancel: (
+          handler: CancelHandler
+        ) => ReturnType<SafeFlowCreator<TReturn, TThis, TParam, true>>;
       });
 
-type Canceler = (reason: any, isThrow?: boolean, batching?: boolean) => any;
+type Canceler = (reason: any, isDropout?: boolean) => any;
 
 /* istanbul ignore next */
 function report() {
   return new Error('[safe-flow] Please report this bug to the author.');
 }
 
-const outOfControlMsg =
-  '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.';
-function outOfControl() {
-  return new Error(outOfControlMsg);
+const lostControlMsg =
+  '[safe-flow] Some child threads have lost control. There should be no unfinished child threads in the completed parent thread.';
+function lostControl() {
+  return new Error(lostControlMsg);
 }
 
-export enum FlowState {
-  canceled = 1,
-  done,
+const manualBreakMsg =
+  '[safe-flow] In the cancelled thread, no new child threads should be started. When autoBreak is set to false, you must manually end function execution of the cancelled thread.';
+function manualBreak() {
+  return new Error(manualBreakMsg);
 }
 
-export enum ErrfState {
-  error = 1,
-  canceled,
-  done,
+const cancelSelfErrMsg =
+  '[safe-flow] The called cancelSelf method is not in the currently running thread, or the thread is cancelled when autoBreak is false. Don not call it in other asynchronous callback.';
+function cancelSelfErr() {
+  return new Error(cancelSelfErrMsg);
 }
+
+export const FlowState = { canceled: 1, done: 2 } as const;
+export const ErrfState = { error: 1, canceled: 2, done: 3 } as const;
 
 export enum PromiseState {
   pending,
@@ -132,6 +118,8 @@ export class Thread {
   canceler?: Canceler;
   cancellation?: Canceled;
   children: Thread[] = [];
+  willCancel = false;
+  willBreak = false;
 
   get hasChildren() {
     return Boolean(this.children.length);
@@ -161,6 +149,7 @@ export class Thread {
     public parent: Thread | undefined,
     public token: any,
     public trace: boolean | Trace,
+    public autoBreak = true,
     public name?: string,
     public id?: number,
     public onState?: StateHandler,
@@ -170,7 +159,7 @@ export class Thread {
     if (__debug_enable_value) __debug_live_threads.push(this);
   }
 
-  changeState(state: TraceState.thread_start): void;
+  changeState(state: TraceState.thread_starting): void;
   changeState(state: TraceState.thread_idle): void;
   changeState(state: TraceState.thread_canceled, reason: unknown): void;
   changeState(state: TraceState.thread_error, error: unknown): void;
@@ -198,7 +187,7 @@ export class Thread {
     if (this.trace && this.name) {
       /* istanbul ignore else */
       if (
-        state === TraceState.thread_start ||
+        state === TraceState.thread_starting ||
         state === TraceState.thread_idle ||
         state === TraceState.thread_completed ||
         state === TraceState.thread_disposed
@@ -256,6 +245,7 @@ export class Thread {
       this.parent.levelup();
     }
 
+    inThread = Boolean(this.parent);
     //@ts-expect-error
     this.func = undefined;
     //@ts-expect-error
@@ -307,24 +297,30 @@ export type StateHandler = (state: TraceState, thread: Thread) => any;
 type Config = {
   trace?: boolean | Trace;
   standalone?: boolean;
+  autoBreak?: boolean;
   filter?: Filter;
   onState?: StateHandler;
+  development?: 'auto' | 'development' | 'production';
 };
 
 const defConfig: RequiredPick<Config, 'trace' | 'standalone' | 'filter'> = {
   trace: false,
   standalone: false,
   filter: () => false,
+  development: 'auto',
 } as const;
 let config = defConfig;
+
 export function configure(options?: Config) {
   if (options) config = defaults(options, config);
   else config = defConfig;
 }
 
 const tokenCreators = new Map<any, SafeFlowCreator[]>();
-const creatorProcesses = new Map<SafeFlowCreator, Thread[]>();
+const creatorThreads = new Map<SafeFlowCreator, Thread[]>();
 
+let inDead = false;
+let inThread = false;
 let currentThread: Thread | undefined;
 function setCurrThread(thread?: Thread) {
   if (__debug_enable_value) {
@@ -341,8 +337,8 @@ function setCurrThread(thread?: Thread) {
 
   currentThread = thread;
 }
-function getCurrThread() {
-  return currentThread;
+function current() {
+  return inThread ? currentThread : undefined;
 }
 
 /* istanbul ignore next */
@@ -355,14 +351,16 @@ const logger = {
 export const __debug_logger = logger;
 
 export const __debug_token_creators = tokenCreators;
-export const __debug_creator_processes = creatorProcesses;
-export const __debug_get_curr_thread = getCurrThread;
+export const __debug_creator_processes = creatorThreads;
+export const __debug_get_curr_thread = () => {
+  return currentThread;
+};
 export function __debug_clear_names() {
   names = {};
 }
 export function __debug_clear_threads() {
   tokenCreators.clear();
-  creatorProcesses.clear();
+  creatorThreads.clear();
   __debug_live_threads.forEach((thread) => {
     thread.complete();
   });
@@ -376,9 +374,13 @@ export function __debug_enable(value: boolean) {
 }
 export const __debug_live_threads: Thread[] = [];
 
+export function __debug_in_thread() {
+  return inThread;
+}
+
 export enum TraceState {
   creator_created,
-  thread_start,
+  thread_starting,
   thread_idle,
   thread_canceled,
   thread_error,
@@ -421,7 +423,7 @@ export type TraceEvent =
       name: string;
       id?: number;
       state:
-        | TraceState.thread_start
+        | TraceState.thread_starting
         | TraceState.thread_idle
         | TraceState.thread_completed
         | TraceState.thread_disposed;
@@ -443,7 +445,7 @@ const defTrace: Trace = (event) => {
     status = 'done (canceled)' + (event.value ? ` ${event.value}` : '');
   } else {
     switch (state) {
-      case TraceState.thread_start:
+      case TraceState.thread_starting:
         status = 'start';
         break;
       case TraceState.thread_idle:
@@ -500,17 +502,18 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
 ): SafeFlowCreator<TReturn, ThisParameterType<typeof func>, TParam> {
   const opts = defaults(options, config);
   let { token } = opts;
-  const { trace, name, standalone, onState, plugins } = opts;
+  const { trace, autoBreak, name, standalone, onState, plugins } = opts;
   if (trace && name) {
     registerName(name);
     tracing(trace, { name, state: TraceState.creator_created });
   }
 
   return function safe_flow_creator(this: TThis, ...args: TParam) {
-    const parentThread = getCurrThread();
-
+    if (inDead) {
+      throw manualBreak();
+    }
+    const parentThread = current();
     const id = trace && !standalone && name ? takeNumber(name) : undefined;
-
     token === undefined && (token = thisArg);
     let creators = tokenCreators.get(token);
     if (creators) {
@@ -518,7 +521,7 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
         creators.push(safe_flow_creator);
       } else if (standalone) {
         throw new Error(
-          '[safe-flow] Standalone mode flow only allows one process to execute.'
+          '[safe-flow] Standalone mode flow only allows one thread to execute for one creator.'
         );
       }
     } else {
@@ -527,12 +530,12 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
       tokenCreators.set(token, creators);
     }
 
-    !creatorProcesses.has(safe_flow_creator) &&
-      creatorProcesses.set(safe_flow_creator, []);
-    const process = creatorProcesses.get(safe_flow_creator);
+    !creatorThreads.has(safe_flow_creator) &&
+      creatorThreads.set(safe_flow_creator, []);
+    const threads = creatorThreads.get(safe_flow_creator);
 
     /* istanbul ignore if */
-    if (!process) throw report();
+    if (!threads) throw report();
 
     const thread = new Thread(
       func,
@@ -540,30 +543,42 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
       parentThread,
       token,
       trace,
+      autoBreak,
       name,
       id,
       onState,
       plugins
     );
-    process.push(thread);
-    thread.changeState(TraceState.thread_start);
+    threads.push(thread);
+    thread.changeState(TraceState.thread_starting);
     setCurrThread(thread);
 
-    let cancelHandler: undefined | CancelHandler = undefined;
-    let errfPromise: undefined | any = undefined;
+    Promise.resolve().then(() => {
+      inThread = false;
+    });
+    inThread = true;
+
+    let cancelHandlers: CancelHandler[] = [];
     const promise = new Promise((resolve, reject) => {
-      thread.canceler = (reason, isThrow = false, batching = true) => {
-        cancelChildren(thread, reason, true);
+      thread.canceler = (reason, isDropout) => {
+        if (thread.state === TraceState.thread_starting) {
+          throw new Error(
+            '[safe-flow] Do not cancel the thread while starting.'
+          );
+        }
+
+        thread.willCancel = true;
+        cancelChildren(thread, reason);
         if (parentThread) {
           parentThread.removeChild(thread);
         }
 
         const { creator, token } = thread;
-        const process = creatorProcesses.get(creator);
+        const threads = creatorThreads.get(creator);
         const creators = tokenCreators.get(token);
         /* istanbul ignore if */
-        if (!process || !creators) throw report();
-        if (!batching) dropout(thread, process, creator, creators);
+        if (!threads || !creators) throw report();
+        if (isDropout) dropout(thread, threads, creator, creators);
 
         const cancellation = new Canceled(
           safe_flow_creator,
@@ -574,13 +589,29 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
         thread.cancellation = cancellation;
         thread.canceled = true;
         thread.changeState(TraceState.thread_canceled, reason);
-        if (cancelHandler) cancelHandler(reason);
+        cancelHandlers.forEach((handler) => {
+          handler(reason);
+        });
+        cancelHandlers.length = 0;
+        //@ts-expect-error
+        cancelHandlers = undefined;
 
         thread.complete(false);
         setCurrThread(parentThread);
 
-        if (isThrow) reject(getBreakMsg());
+        if (
+          parentThread &&
+          !parentThread.willBreak &&
+          parentThread.willCancel &&
+          parentThread.autoBreak
+        )
+          reject(getBreakMsg());
         else resolve([cancellation]);
+
+        Promise.resolve().then(() => {
+          inDead = false;
+        });
+        inDead = true;
       };
 
       if (parentThread) parentThread.addChild(thread);
@@ -597,23 +628,22 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
         if (!creators) throw report();
         /* istanbul ignore else */
         if (result.length === CatchFirst.caught) {
-          cancelChildren(
-            thread,
-            'An error occurred in the parent thread.',
-            false
-          );
+          cancelChildren(thread, 'An error occurred in the parent thread.');
           const [caught] = result;
           thread.changeState(TraceState.thread_error, caught);
-          dropout(thread, process, safe_flow_creator, creators);
+          dropout(thread, threads, safe_flow_creator, creators);
           thread.complete();
           setCurrThread(parentThread);
           reject(caught);
         } else if (result.length === CatchFirst.done) {
           const [, done] = result;
           thread.changeState(TraceState.thread_done, done);
-          dropout(thread, process, safe_flow_creator, creators);
+          dropout(thread, threads, safe_flow_creator, creators);
           if (thread.hasChildren) {
-            reject(outOfControl());
+            cancelChildren(thread, 'An error occurred in the parent thread.');
+            thread.complete();
+            setCurrThread(parentThread);
+            reject(lostControl());
             return;
           }
           thread.complete();
@@ -623,10 +653,10 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
           throw report();
         }
       });
-      if (!thread.canceled) {
-        thread.changeState(TraceState.thread_idle);
-        setCurrThread(parentThread);
-      }
+      thread.changeState(TraceState.thread_idle);
+      setCurrThread(parentThread);
+      if (!thread.parent) inThread = false;
+      inDead = false;
     }) as ReturnType<SafeFlowCreator<TReturn, TThis, TParam>>;
 
     promise.safe_flow_promise = true;
@@ -642,26 +672,22 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
     promise.state = () => thread.promiseState;
 
     promise.onCancel = (handler: (reason: any) => any) => {
-      cancelHandler = handler;
-      if (errfPromise) {
-        errfPromise.onCancel = undefined;
-        return errfPromise;
-      } else {
-        //@ts-expect-error
-        promise.onCancel = undefined;
-        return promise;
-      }
+      cancelHandlers.push(handler);
+      return promise;
     };
 
     promise.errf = () => {
-      errfPromise = promise
+      const errfPromise = promise
         .then(([canceled, data]) => {
           if (canceled === null)
             return [null, null, data] as [null, null, TReturn];
           return [null, canceled] as [null, Canceled];
         })
-        .catch((error: any) => {
-          if (error === breakMsg || error.message === outOfControlMsg)
+        .catch((error: unknown) => {
+          if (
+            error === breakMsg ||
+            (error instanceof Error && error.message === lostControlMsg)
+          )
             throw error;
           return [error] as [unknown];
         }) as any;
@@ -669,14 +695,23 @@ function internalFlow<TReturn = any, TThis = any, TParam extends any[] = any>(
       errfPromise.cancel = promise.cancel;
       errfPromise.canceled = promise.canceled;
       errfPromise.state = promise.state;
-      errfPromise.onCancel = promise.onCancel;
-      //@ts-expect-error
-      promise.errf = undefined;
+      errfPromise.onCancel = (handler: (reason: any) => any) => {
+        cancelHandlers.push(handler);
+        return errfPromise;
+      };
       return errfPromise;
     };
 
     return promise;
   } as any;
+}
+
+export function isInvalid() {
+  if (!inDead && !inThread)
+    throw new Error(
+      '[safe-flow] The called isInvalid method is not in the currently running thread. Don not call it in other asynchronous callback.'
+    );
+  return !current();
 }
 
 export function isSafeFlowPromise(promise: any) {
@@ -687,24 +722,22 @@ export function isCreator(func: Function) {
   return typeof func === 'function' && func.name === 'safe_flow_creator';
 }
 
-function cancelChildren(thread: Thread, reason?: any, isThrow?: boolean) {
+function cancelChildren(thread: Thread, reason?: any) {
   const { children } = thread;
   children.concat().forEach((child) => {
-    /* istanbul ignore else */
-    if (!child.canceled) internalCancelSelf(child, reason, isThrow);
-    else throw report();
+    internalCancelSelf(child, reason);
   });
 }
 
 function dropout(
   thread: Thread,
-  process: Thread[],
+  threads: Thread[],
   creator: SafeFlowCreator,
   creators: SafeFlowCreator[]
 ) {
-  process.splice(process.indexOf(thread), 1);
-  if (process.length === 0) {
-    creatorProcesses.delete(creator);
+  threads.splice(threads.indexOf(thread), 1);
+  if (threads.length === 0) {
+    creatorThreads.delete(creator);
     creators.splice(creators.indexOf(creator), 1);
     if (creators.length === 0) {
       tokenCreators.delete(thread.token);
@@ -715,22 +748,17 @@ function dropout(
 export function cancel(creator: SafeFlowCreator, reason?: any): void;
 export function cancel(token?: any, reason?: any): void;
 export function cancel(tokenOrCreator: any, reason?: any) {
-  const currThread = getCurrThread();
-  if (currThread && currThread.hasChildren) {
-    throw outOfControl();
-  }
+  const currThread = current();
   internalCancel(currThread, tokenOrCreator, reason);
 }
 
 export function cancelAll(reason?: any) {
-  const currThread = getCurrThread();
-  if (currThread && currThread.hasChildren) {
-    throw outOfControl();
-  }
+  const currThread = current();
+  if (currThread) currThread.willBreak = true;
   tokenCreators.forEach((_creator, token) => {
-    internalCancel(currThread, token, reason);
+    internalCancel(currThread, token, reason, true);
   });
-  if (currThread) {
+  if (currThread && currThread.autoBreak) {
     throw getBreakMsg();
   }
 }
@@ -738,21 +766,23 @@ export function cancelAll(reason?: any) {
 function internalCancel(
   currThread: Thread | undefined,
   tokenOrCreator: any,
-  reason?: any
+  reason?: any,
+  all = false
 ) {
   let isThrow = false;
   if (isCreator(tokenOrCreator)) {
-    const process = creatorProcesses.get(tokenOrCreator);
-    if (process) {
-      const token = process[0].token;
-      process.forEach((thread) => {
+    const threads = creatorThreads.get(tokenOrCreator);
+    if (threads) {
+      const token = threads[0].token;
+      threads.forEach((thread) => {
         /* istanbul ignore if */
         if (!thread.canceler) throw report();
-        thread.canceler(reason);
-        if (thread === currThread) isThrow = true;
+        if (!all && currThread && !isThrow)
+          isThrow = currThread.willBreak = inTree(thread, currThread);
+        thread.canceler(reason, false);
       });
-      process.length = 0;
-      creatorProcesses.delete(tokenOrCreator);
+      threads.length = 0;
+      creatorThreads.delete(tokenOrCreator);
 
       const creators = tokenCreators.get(token);
       /* istanbul ignore if */
@@ -768,50 +798,55 @@ function internalCancel(
     const creators = tokenCreators.get(tokenOrCreator);
     if (creators) {
       creators.forEach((creator) => {
-        const process = creatorProcesses.get(creator);
-
+        const threads = creatorThreads.get(creator);
         /* istanbul ignore if */
-        if (!process) throw report();
-
-        process.forEach((thread) => {
+        if (!threads) throw report();
+        threads.forEach((thread) => {
           /* istanbul ignore if */
           if (!thread.canceler) throw report();
-
-          thread.canceler(reason);
-
-          if (thread === currThread) isThrow = true;
+          if (!all && currThread && !isThrow)
+            isThrow = currThread.willBreak = inTree(thread, currThread);
+          thread.canceler(reason, false);
         });
-        process.length = 0;
-        creatorProcesses.delete(creator);
+        threads.length = 0;
+        creatorThreads.delete(creator);
       });
       tokenCreators.delete(tokenOrCreator);
     }
   }
-  if (isThrow && currThread) {
+  if (isThrow && currThread && currThread.autoBreak) {
     throw getBreakMsg();
   }
+}
+
+function inTree(tree: Thread, target: Thread): boolean {
+  if (tree === target) return true;
+  const { children } = tree;
+  return children.some((child) => {
+    if (child !== target) {
+      return inTree(target, child);
+    } else {
+      return true;
+    }
+  });
 }
 
 export function cancelSelf(reason?: any) {
-  const currThread = getCurrThread();
+  const currThread = current();
   if (currThread) {
-    if (currThread.hasChildren) {
-      throw outOfControl();
-    }
+    currThread.willBreak = true;
     internalCancelSelf(currThread, reason);
-    throw getBreakMsg();
+    if (currThread.autoBreak) throw getBreakMsg();
   } else {
-    throw new Error(
-      '[safe-flow] The cancelSelf method must be invoked in the currently running flow thread. Don not call it in other asynchronous callback.'
-    );
+    throw cancelSelfErr();
   }
 }
 
-function internalCancelSelf(thread: Thread, reason?: any, isThrow = false) {
+function internalCancelSelf(thread: Thread, reason?: any) {
   const { canceler } = thread;
   /* istanbul ignore if */
   if (!canceler) throw report();
-  canceler(reason, isThrow, false);
+  canceler(reason, true);
 }
 
 export function flowed<TReturn = any, TThis = any, TParam extends any[] = any>(
@@ -874,7 +909,7 @@ function flowupProp(
     } else return;
   }
 
-  const { names, token, trace, standalone, plugins } = options;
+  const { names, token, trace, autoBreak, standalone, plugins } = options;
   let name: string | undefined;
   if (trace && names) {
     /* istanbul ignore else */
@@ -889,6 +924,7 @@ function flowupProp(
   const flowOpts = {
     token,
     trace,
+    autoBreak,
     name,
     standalone,
     plugins,

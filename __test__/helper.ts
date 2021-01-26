@@ -12,6 +12,7 @@ import {
   flow,
   FlowOptions,
   SafeFlowCreator,
+  __debug_in_thread,
 } from '../src';
 
 let currTime = 0;
@@ -90,13 +91,14 @@ export function verify(currThread = true) {
   expect(__debug_creator_processes.size).toBe(0);
   expect(__debug_token_creators.size).toBe(0);
   if (currThread) expect(__debug_get_curr_thread()).toBeUndefined();
+  expect(__debug_in_thread()).toBeFalsy();
 }
 
 class MobxPlugin implements Plugin {
   currInfo: IActionRunInfo | undefined = undefined;
   onState(state: TraceState, thread: Thread) {
     const { parent, name, func } = thread;
-    if (state === TraceState.thread_start) {
+    if (state === TraceState.thread_starting) {
       this.endAction();
       if (!isAction(func)) {
         this.currInfo = _startAction(name ? name : 'unknow', false, undefined);

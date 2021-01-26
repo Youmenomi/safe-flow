@@ -19,6 +19,7 @@ import {
   isSafeFlowPromise,
   plugins,
   Plugin,
+  isInvalid,
 } from '../src';
 import {
   checkType,
@@ -65,6 +66,7 @@ enum CancelMethod {
   cancelAll,
   promiseCancel,
 }
+
 describe('safe-flow', () => {
   let print = false;
   let i = 0;
@@ -88,6 +90,203 @@ describe('safe-flow', () => {
     await delay(50);
     verify();
     expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('isInvalid', async () => {
+    expect(() => isInvalid()).toThrowError(
+      '[safe-flow] The called isInvalid method is not in the currently running thread. Don not call it in other asynchronous callback.'
+    );
+
+    {
+      const input = jest.fn();
+      const f1 = flow(async () => {
+        timeout(() => {
+          try {
+            isInvalid();
+          } catch (error) {
+            input(error.message);
+          }
+        }, 5);
+      });
+      f1();
+      await delay(5);
+      expect(input).lastCalledWith(
+        '[safe-flow] The called isInvalid method is not in the currently running thread. Don not call it in other asynchronous callback.'
+      );
+    }
+
+    {
+      const func = jest.fn();
+      let result: [Canceled] | [null, void] | undefined;
+      const f1 = flow(
+        async () => {
+          result = await flow(delay)(10).onCancel(func);
+          func();
+          if (isInvalid()) return;
+          if (result.length === FlowState.canceled) {
+            //
+          } else if (result.length === FlowState.done) {
+            //
+          }
+          cancelSelf();
+          func();
+          if (isInvalid()) return;
+          func();
+          await flow(delay)(10);
+        },
+        { autoBreak: false }
+      );
+
+      await f1();
+      expect(func).toBeCalledTimes(2);
+      expect(result).toEqual([null, undefined]);
+      verify();
+      await delay(1);
+      expect(__debug_live_threads.length).toBe(0);
+
+      func.mockClear();
+      timeout(() => {
+        cancel(f1);
+      }, 5);
+      await f1();
+      expect(func).toBeCalledTimes(2);
+      expect(result).toBeDefined();
+      if (result) {
+        expect(result.length).toBe(FlowState.canceled);
+        if (result.length === FlowState.canceled) {
+          const [canceled] = result;
+          expect(canceled).toBeInstanceOf(Canceled);
+        }
+      }
+      verify();
+      await delay(10);
+      expect(__debug_live_threads.length).toBe(0);
+    }
+  });
+
+  it('set autoBreak to false', async () => {
+    const func = jest.fn();
+    const input = jest.fn();
+    {
+      func.mockClear();
+      input.mockClear();
+      const f1 = flow(
+        async () => {
+          await flow(delay)(10);
+          func();
+          try {
+            await flow(delay)(10);
+          } catch (error) {
+            input(error.message);
+            return;
+          }
+          func();
+        },
+        { autoBreak: false }
+      );
+
+      timeout(() => {
+        cancel(f1);
+      }, 5);
+      await f1();
+      expect(func).toBeCalledTimes(1);
+      expect(input).toBeCalledTimes(1);
+      expect(input).lastCalledWith(
+        '[safe-flow] In the cancelled thread, no new child threads should be started. When autoBreak is set to false, you must manually end function execution of the cancelled thread.'
+      );
+      verify();
+      await delay(10);
+      expect(__debug_live_threads.length).toBe(0);
+    }
+    {
+      func.mockClear();
+      input.mockClear();
+      const f1 = flow(
+        async () => {
+          await flow(delay)(10);
+          func();
+          try {
+            cancelSelf();
+          } catch (error) {
+            input(error.message);
+            return;
+          }
+          func();
+        },
+        { autoBreak: false }
+      );
+
+      timeout(() => {
+        cancel(f1);
+      }, 5);
+      await f1();
+      expect(func).toBeCalledTimes(1);
+      expect(input).toBeCalledTimes(1);
+      expect(input).lastCalledWith(
+        '[safe-flow] The called cancelSelf method is not in the currently running thread, or the thread is cancelled when autoBreak is false. Don not call it in other asynchronous callback.'
+      );
+      verify();
+      await delay(10);
+      expect(__debug_live_threads.length).toBe(0);
+    }
+    {
+      func.mockClear();
+      input.mockClear();
+      const f1 = flow(
+        async () => {
+          await flow(delay)(5);
+          cancelSelf();
+          func();
+          try {
+            cancelSelf();
+          } catch (error) {
+            input(error.message);
+            return;
+          }
+          func();
+        },
+        { autoBreak: false }
+      );
+
+      await f1();
+      expect(func).toBeCalledTimes(1);
+      expect(input).toBeCalledTimes(1);
+      expect(input).lastCalledWith(
+        '[safe-flow] The called cancelSelf method is not in the currently running thread, or the thread is cancelled when autoBreak is false. Don not call it in other asynchronous callback.'
+      );
+      verify();
+      await delay(1);
+      expect(__debug_live_threads.length).toBe(0);
+    }
+    {
+      func.mockClear();
+      input.mockClear();
+      const f1 = flow(
+        async () => {
+          await flow(delay)(5);
+          cancelSelf();
+          func();
+          try {
+            await flow(delay)(10);
+          } catch (error) {
+            input(error.message);
+            return;
+          }
+          func();
+        },
+        { autoBreak: false }
+      );
+
+      await f1();
+      expect(func).toBeCalledTimes(1);
+      expect(input).toBeCalledTimes(1);
+      expect(input).lastCalledWith(
+        '[safe-flow] In the cancelled thread, no new child threads should be started. When autoBreak is set to false, you must manually end function execution of the cancelled thread.'
+      );
+      verify();
+      await delay(1);
+      expect(__debug_live_threads.length).toBe(0);
+    }
   });
 
   describe('fetch', () => {
@@ -586,6 +785,27 @@ describe('safe-flow', () => {
     });
   });
 
+  it('staggered execution', async () => {
+    const f1 = flow(async () => {
+      await flow(delay)(10);
+      await flow(delay)(10);
+    });
+
+    const f2 = flow(async () => {
+      await flow(delay)(10);
+      await flow(delay)(10);
+    });
+
+    timeout(() => {
+      f2();
+    }, 12);
+    await f1();
+
+    await delay(40);
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
   it('add plugin to plugins', async () => {
     const onState = jest.fn((state: TraceState) => state);
     const plugin: Plugin = {
@@ -600,7 +820,7 @@ describe('safe-flow', () => {
     await f1('foo');
     verify();
     expect(__debug_live_threads.length).toBe(0);
-    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_starting);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
@@ -622,7 +842,7 @@ describe('safe-flow', () => {
     await f1('foo');
     verify();
     expect(__debug_live_threads.length).toBe(0);
-    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_starting);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
@@ -638,7 +858,7 @@ describe('safe-flow', () => {
     await store.foo1();
     verify();
     expect(__debug_live_threads.length).toBe(0);
-    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_starting);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
@@ -651,7 +871,7 @@ describe('safe-flow', () => {
     await f1('foo');
     verify();
     expect(__debug_live_threads.length).toBe(0);
-    expect(onState).nthReturnedWith(++i, TraceState.thread_start);
+    expect(onState).nthReturnedWith(++i, TraceState.thread_starting);
     expect(onState).nthReturnedWith(++i, TraceState.thread_idle);
     expect(onState).nthReturnedWith(++i, TraceState.thread_done);
     expect(onState).nthReturnedWith(++i, TraceState.thread_completed);
@@ -802,6 +1022,51 @@ describe('safe-flow', () => {
       await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     }
+  });
+
+  it('cancel the thread while starting.', async () => {
+    {
+      const f1 = flow(async () => {
+        cancel(f1);
+      });
+
+      await expect(async () => await f1()).rejects.toThrowError(
+        '[safe-flow] Do not cancel the thread while starting.'
+      );
+    }
+    {
+      const f1 = flow(async () => {
+        await f2();
+      });
+      const f2 = flow(async () => {
+        await f3();
+      });
+      const f3 = flow(async () => {
+        cancel(f1);
+      });
+      await expect(async () => await f1()).rejects.toThrowError(
+        '[safe-flow] Do not cancel the thread while starting.'
+      );
+    }
+    {
+      const input = jest.fn();
+      const f1 = flow(async () => {
+        f2();
+      });
+      const f2 = flow(async () => {
+        try {
+          cancel(f1);
+        } catch (error) {
+          input(error.message);
+        }
+      });
+      await f1();
+      await expect(input).lastCalledWith(
+        '[safe-flow] Do not cancel the thread while starting.'
+      );
+    }
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   describe('Cancel immediately cancel after the main thread starts', () => {
@@ -997,7 +1262,7 @@ describe('safe-flow', () => {
     await expect(async () => {
       await Promise.all([f1(), f1(), f1()]);
     }).rejects.toThrowError(
-      '[safe-flow] Standalone mode flow only allows one process to execute.'
+      '[safe-flow] Standalone mode flow only allows one thread to execute for one creator.'
     );
 
     await delay(10);
@@ -1101,6 +1366,45 @@ describe('safe-flow', () => {
     await store.foo();
     verify();
     await delay(10);
+    expect(__debug_live_threads.length).toBe(0);
+  });
+
+  it('cancel parallel threads and handle onCancel', async () => {
+    const func = jest.fn();
+    const func1 = jest.fn();
+    const func2 = jest.fn();
+    const func3 = jest.fn();
+
+    const f1 = flow(delay);
+    const f2 = flow(delay);
+    const f3 = flow(delay);
+
+    const f4 = flow(async () => {
+      const p1 = f1(5).onCancel((reason) => {
+        func1(reason);
+      });
+      const p2 = f2(10).onCancel((reason) => {
+        func2(reason);
+      });
+      const p3 = f3(15).onCancel((reason) => {
+        func3(reason);
+      });
+      await Promise.all([p1, p2, p3]);
+      func();
+    });
+
+    const promise = f4();
+    cancel(f4, 'test');
+    await promise;
+    expect(func).not.toBeCalled();
+    expect(func1).toBeCalledTimes(1);
+    expect(func1).toBeCalledWith('test');
+    expect(func2).toBeCalledTimes(1);
+    expect(func2).toBeCalledWith('test');
+    expect(func3).toBeCalledTimes(1);
+    expect(func3).toBeCalledWith('test');
+    verify();
+    await delay(20);
     expect(__debug_live_threads.length).toBe(0);
   });
 
@@ -1288,6 +1592,7 @@ describe('safe-flow', () => {
     });
     const f4 = flow(
       async () => {
+        await flow(delay)(1);
         cancel('token');
         func();
         throw Error('Error occurred!');
@@ -1295,6 +1600,7 @@ describe('safe-flow', () => {
       { token: 'token' }
     );
     const f5 = flow(async () => {
+      await flow(delay)(1);
       cancel(f5);
       func();
       throw Error('Error occurred!');
@@ -1384,7 +1690,7 @@ describe('safe-flow', () => {
 
     timeout(() => {
       expect(() => cancelSelf()).toThrowError(
-        '[safe-flow] The cancelSelf method must be invoked in the currently running flow thread. Don not call it in other asynchronous callback.'
+        '[safe-flow] The called cancelSelf method is not in the currently running thread, or the thread is cancelled when autoBreak is false. Don not call it in other asynchronous callback.'
       );
     }, 5);
     let [canceled] = await flowed(store.foo)();
@@ -1471,29 +1777,6 @@ describe('safe-flow', () => {
     }
   });
 
-  it('Unable to detect illegal call to child thread', async () => {
-    const func = jest.fn();
-
-    class Store {
-      @flowable
-      async foo1() {
-        const foo2 = flow(response, { token: 'foo2' });
-        foo2('foo2').errf();
-        foo2('foo2').errf();
-        await foo2('foo2').errf();
-        func();
-        return 'foo1';
-      }
-    }
-    const store = flowup(new Store());
-
-    const [, done] = await flowed(store.foo1)();
-    expect(done).toBe('foo1');
-    expect(func).toBeCalledTimes(1);
-    verify();
-    expect(__debug_live_threads.length).toBe(0);
-  });
-
   it('invoke child flow thread without the await operator', async () => {
     const func = jest.fn();
 
@@ -1503,8 +1786,6 @@ describe('safe-flow', () => {
         async foo1() {
           const foo2 = flow(response, { token: 'foo2' });
           foo2('foo2').errf();
-          foo2('foo2').errf();
-          foo2('foo2').errf();
           func();
         }
       }
@@ -1513,7 +1794,7 @@ describe('safe-flow', () => {
       await expect(async () => {
         await flowed(store.foo1)().errf();
       }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+        '[safe-flow] Some child threads have lost control. There should be no unfinished child threads in the completed parent thread.'
       );
       expect(func).toBeCalledTimes(1);
     }
@@ -1525,7 +1806,27 @@ describe('safe-flow', () => {
         async foo1() {
           const foo2 = flow(response, { token: 'foo2' });
           foo2('foo2').errf();
-          cancelSelf();
+          foo2('foo2').errf();
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await expect(async () => {
+        await flowed(store.foo1)().errf();
+      }).rejects.toThrowError(
+        '[safe-flow] Some child threads have lost control. There should be no unfinished child threads in the completed parent thread.'
+      );
+      expect(func).toBeCalledTimes(1);
+    }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(response, { token: 'foo2' });
+          Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
           func();
         }
       }
@@ -1534,8 +1835,26 @@ describe('safe-flow', () => {
       await expect(async () => {
         await flowed(store.foo1)();
       }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
+        '[safe-flow] Some child threads have lost control. There should be no unfinished child threads in the completed parent thread.'
       );
+      expect(func).toBeCalledTimes(1);
+    }
+
+    {
+      func.mockClear();
+      class Store {
+        @flowable
+        async foo1() {
+          const foo2 = flow(response, { token: 'foo2' });
+          foo2('foo2').errf();
+          await flow(delay)(5);
+          cancelSelf();
+          func();
+        }
+      }
+      const store = flowup(new Store());
+
+      await flowed(store.foo1)();
       expect(func).toBeCalledTimes(0);
     }
 
@@ -1546,17 +1865,14 @@ describe('safe-flow', () => {
         async foo1() {
           const foo2 = flow(response, { token: 'foo2' });
           Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
+          await flow(delay)(5);
           cancel(this);
           func();
         }
       }
       const store = flowup(new Store());
 
-      await expect(async () => {
-        await flowed(store.foo1)();
-      }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
-      );
+      await flowed(store.foo1)();
       expect(func).toBeCalledTimes(0);
     }
 
@@ -1573,12 +1889,8 @@ describe('safe-flow', () => {
       }
       const store = flowup(new Store());
 
-      await expect(async () => {
-        await flowed(store.foo1)();
-      }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
-      );
-      expect(func).toBeCalledTimes(0);
+      await flowed(store.foo1)();
+      expect(func).toBeCalledTimes(1);
     }
 
     {
@@ -1588,17 +1900,14 @@ describe('safe-flow', () => {
         async foo1() {
           const foo2 = flow(response, { token: 'foo2' });
           Promise.all([foo2('foo2'), foo2('foo2'), foo2('foo2')]);
+          await flow(delay)(5);
           cancelAll();
           func();
         }
       }
       const store = flowup(new Store());
 
-      await expect(async () => {
-        await flowed(store.foo1)();
-      }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
-      );
+      await flowed(store.foo1)();
       expect(func).toBeCalledTimes(0);
     }
 
@@ -1616,12 +1925,8 @@ describe('safe-flow', () => {
       }
       const store = flowup(new Store());
 
-      await expect(async () => {
-        await flowed(store.foo1)();
-      }).rejects.toThrowError(
-        '[safe-flow] There are child threads out of control. The flow thread in another thread can only be used with the await operator.'
-      );
-      expect(func).toBeCalledTimes(0);
+      await flowed(store.foo1)();
+      expect(func).toBeCalledTimes(1);
     }
 
     await delay(10);
@@ -1641,12 +1946,9 @@ describe('safe-flow', () => {
 
     //@ts-expect-error
     const f1 = flow(() => undefined);
-    const result = await f1();
-    expect(result.length).toBe(FlowState.done);
-    if (result.length === FlowState.done) {
-      const [, done] = result;
-      expect(done).toBe(undefined);
-    }
+    await expect(async () => await f1()).rejects.toThrowError(
+      "Cannot read property 'then' of undefined"
+    );
 
     {
       class Store {
@@ -1656,12 +1958,9 @@ describe('safe-flow', () => {
         }
       }
       const store = flowup(new Store());
-      const result = await store.foo1('test');
-      expect(result.length).toBe(FlowState.done);
-      if (result.length === FlowState.done) {
-        const [, done] = result;
-        expect(done).toBe('test');
-      }
+      await expect(async () => await store.foo1('test')).rejects.toThrowError(
+        'promise.then is not a function'
+      );
     }
     {
       class Store {
@@ -1671,12 +1970,9 @@ describe('safe-flow', () => {
         }
       }
       const store = flowup(new Store());
-      const result = await store.foo1('test');
-      expect(result.length).toBe(FlowState.done);
-      if (result.length === FlowState.done) {
-        const [, done] = result;
-        expect(done).toBe('test');
-      }
+      await expect(async () => await store.foo1('test')).rejects.toThrowError(
+        'promise.then is not a function'
+      );
     }
     {
       class Store {
@@ -1687,13 +1983,11 @@ describe('safe-flow', () => {
       const store = flowup(new Store(), {
         names: { foo1: true },
       });
-      //@ts-expect-error
-      const result = await flowed(store).foo1('test');
-      expect(result.length).toBe(FlowState.done);
-      if (result.length === FlowState.done) {
-        const [, done] = result;
-        expect(done).toBe('test');
-      }
+
+      await expect(
+        //@ts-expect-error
+        async () => await flowed(store).foo1('test')
+      ).rejects.toThrowError('promise.then is not a function');
     }
     {
       class Store {
@@ -1704,13 +1998,10 @@ describe('safe-flow', () => {
       const store = flowup(new Store(), {
         filter: (name) => name === 'foo1',
       });
-      //@ts-expect-error
-      const result = await flowed(store).foo1('test');
-      expect(result.length).toBe(FlowState.done);
-      if (result.length === FlowState.done) {
-        const [, done] = result;
-        expect(done).toBe('test');
-      }
+      await expect(
+        //@ts-expect-error
+        async () => await flowed(store).foo1('test')
+      ).rejects.toThrowError('promise.then is not a function');
     }
 
     {
@@ -1762,6 +2053,10 @@ describe('safe-flow', () => {
       });
       expect(store.foo1).toBe('123');
     }
+
+    __debug_clear_threads();
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
   });
 
   it('an error occurred in the thread', async () => {
@@ -1840,21 +2135,44 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
-  it('promise.errf()/promise.onCancel() can only be called once', async () => {
-    const f1 = flow(async () => {
-      return 'foo';
-    });
+  it('promise.errf() / promise.onCancel()', async () => {
+    const func1 = jest.fn();
+    const func2 = jest.fn();
+
+    const f1 = flow(delay);
 
     //@ts-expect-error
-    expect(() => f1().errf().errf()).toThrowError(
+    expect(() => f1(5).errf().errf()).toThrowError(
       'f1(...).errf(...).errf is not a function'
     );
-    //@ts-expect-error
-    expect(() => f1().onCancel().onCancel()).toThrowError(
-      'f1(...).onCancel(...).onCancel is not a function'
-    );
 
+    f1(5)
+      .onCancel(() => {
+        func1();
+      })
+      .onCancel(() => {
+        func1();
+      })
+      .onCancel(() => {
+        func1();
+      });
+
+    f1(5)
+      .errf()
+      .onCancel(() => {
+        func2();
+      })
+      .onCancel(() => {
+        func2();
+      })
+      .onCancel(() => {
+        func2();
+      });
+
+    cancel(f1);
     await delay(5);
+    expect(func1).toBeCalledTimes(3);
+    expect(func2).toBeCalledTimes(3);
     verify();
     expect(__debug_live_threads.length).toBe(0);
   });
@@ -2049,13 +2367,13 @@ describe('safe-flow', () => {
     await flowed(store.foo1)();
     verify();
 
-    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_start);
+    expect(log).nthCalledWith(++i, 'foo1', TraceState.thread_starting);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Change the current thread pointer to [foo1].'
     );
     expect(log).nthCalledWith(++i, 'foo2', TraceState.creator_created);
-    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_start);
+    expect(log).nthCalledWith(++i, 'foo2', TraceState.thread_starting);
     expect(log).nthCalledWith(
       ++i,
       '[safe-flow] Change the current thread pointer to [foo2].'
@@ -2107,12 +2425,7 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
-  function immediately_after_the_main_thread_starts(
-    method: CancelMethod,
-    isTrace = true
-  ) {
-    if (isTrace) immediately_after_the_main_thread_starts(method, false);
-
+  function immediately_after_the_main_thread_starts(method: CancelMethod) {
     const name = (() => {
       switch (method) {
         case CancelMethod.cancelSelf:
@@ -2127,9 +2440,7 @@ describe('safe-flow', () => {
           throw new RangeError(`This parameter is not supported.`);
       }
     })();
-    it(`${name}${isTrace ? ' with trace' : ''}`, async () => {
-      // print = true;
-      configure({ trace: isTrace });
+    it(`${name}`, async () => {
       const func = jest.fn();
 
       const foo1 = flow(
@@ -2154,40 +2465,10 @@ describe('safe-flow', () => {
         { name: 'foo1', token: 'token' }
       );
 
-      const [canceled] = await flowed(foo1)(5);
-      verify();
-      expect(canceled).toBeInstanceOf(Canceled);
-      if (canceled) {
-        expect(canceled.reason).toBe('stop');
-      }
-      expect(func).toBeCalledTimes(0);
-
-      if (!isTrace) {
-        await delay(10);
-        expect(__debug_live_threads.length).toBe(0);
-        return;
-      }
-
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1] Creator is created.');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): start');
-      expect(log).nthCalledWith(
-        ++i,
-        '[safe-flow] Change the current thread pointer to [foo1].'
+      await expect(async () => await flowed(foo1)(5)).rejects.toThrowError(
+        '[safe-flow] Do not cancel the thread while starting.'
       );
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): canceled stop');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): completed');
-      expect(log).nthCalledWith(
-        ++i,
-        '[safe-flow] Clear the current thread pointer.'
-      );
-      expect(log).toBeCalledTimes(i);
-      expect(__debug_live_threads.length).toBe(1);
-      await delay(10);
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): done (canceled)');
-      expect(log).nthCalledWith(++i, '[safe-flow] [foo1](1): disposed');
-      expect(log).toBeCalledTimes(i);
       verify();
-      await delay(10);
       expect(__debug_live_threads.length).toBe(0);
     });
   }
