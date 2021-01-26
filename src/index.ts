@@ -881,14 +881,18 @@ export function internalFlowup(target: any, options?: FlowupOptions) {
     });
   }
 
+  const norepeat: { [key: string]: true } = {};
   Object.getOwnPropertyNames(target).forEach((propertyKey) => {
-    flowupProp(target, propertyKey, opts);
+    norepeat[propertyKey] = true;
   });
   Object.getOwnPropertyNames(Object.getPrototypeOf(target)).forEach(
     (propertyKey) => {
-      flowupProp(target, propertyKey, opts);
+      norepeat[propertyKey] = true;
     }
   );
+  Object.keys(norepeat).forEach((propertyKey) => {
+    flowupProp(target, propertyKey, opts);
+  });
 
   target.__safe_flow_flowup = true;
 }

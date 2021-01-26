@@ -92,6 +92,24 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
+  it('internalFlowup method should only add a single attribute field toflowupProp once.', async () => {
+    class Store {
+      constructor() {
+        this.test = this.test.bind(this);
+      }
+      test() {
+        //
+      }
+    }
+    const store = flowup(new Store(), {
+      trace: true,
+      names: {
+        test: true,
+      },
+    });
+    store;
+  });
+
   it('isInvalid', async () => {
     expect(() => isInvalid()).toThrowError(
       '[safe-flow] The called isInvalid method is not in the currently running thread. Don not call it in other asynchronous callback.'
