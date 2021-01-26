@@ -463,9 +463,7 @@ const defTrace: Trace = (event) => {
   if (event.state === TraceState.creator_created) {
     status = ' Creator is created.';
   } else {
-    /* istanbul ignore if */
-    if (!event.id) throw report();
-    status = `(${event.id})` + ': ' + status;
+    status = (event.id ? `(${event.id})` : '') + ': ' + status;
   }
 
   logger.log(`[safe-flow] [${name}]` + status);

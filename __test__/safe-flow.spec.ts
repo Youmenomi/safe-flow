@@ -2363,6 +2363,38 @@ describe('safe-flow', () => {
     expect(__debug_live_threads.length).toBe(0);
   });
 
+  it('defTrace with standalone', async () => {
+    // print = true;
+    configure({
+      trace: true,
+      standalone: true,
+    });
+
+    const f1 = flow(response, { name: 'f1' });
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1] Creator is created.');
+    await f1('foo1');
+    verify();
+    expect(__debug_live_threads.length).toBe(0);
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1]: start');
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Change the current thread pointer to [f1].'
+    );
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1]: idle');
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1]: done foo1');
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1]: completed');
+    expect(log).nthCalledWith(++i, '[safe-flow] [f1]: disposed');
+    expect(log).nthCalledWith(
+      ++i,
+      '[safe-flow] Clear the current thread pointer.'
+    );
+    expect(log).toBeCalledTimes(i);
+  });
+
   it('custom trace', async () => {
     // print = true;
     configure({
