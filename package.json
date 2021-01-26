@@ -1,6 +1,6 @@
 {
   "name": "safe-flow",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "A safer way to cancel or interrupt the await-async flow.",
   "keywords": [
     "typescript",
