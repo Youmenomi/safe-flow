@@ -26,7 +26,8 @@
     "build:clean": "del dist",
     "build": "npm run ts:check && eslint --ext .ts,.js ./src && npm run build:clean && npm run build:js && npm run build:types",
     "release": "np",
-    "version": "npm run build"
+    "version": "npm run build",
+    "prepare": "husky install"
   },
   "lint-staged": {
     "*.{ts,js}": [
@@ -34,11 +35,6 @@
       "eslint --fix",
       "jest --bail --findRelatedTests"
     ]
-  },
-  "husky": {
-    "hooks": {
-      "pre-commit": "lint-staged"
-    }
   },
   "repository": {
     "type": "git",
@@ -51,36 +47,36 @@
   },
   "homepage": "https://github.com/Youmenomi/safe-flow#readme",
   "devDependencies": {
-    "@babel/plugin-proposal-class-properties": "^7.12.1",
-    "@babel/plugin-proposal-decorators": "^7.12.12",
-    "@babel/preset-env": "^7.12.11",
-    "@babel/preset-typescript": "^7.12.7",
-    "@types/jest": "^26.0.20",
-    "@typescript-eslint/eslint-plugin": "^4.14.1",
-    "@typescript-eslint/parser": "^4.14.1",
+    "@babel/plugin-proposal-class-properties": "^7.13.0",
+    "@babel/plugin-proposal-decorators": "^7.13.5",
+    "@babel/preset-env": "^7.13.12",
+    "@babel/preset-typescript": "^7.13.0",
+    "@types/jest": "^26.0.21",
+    "@typescript-eslint/eslint-plugin": "^4.19.0",
+    "@typescript-eslint/parser": "^4.19.0",
     "axios": "^0.21.1",
     "axios-mock-adapter": "^1.19.0",
     "babel-eslint": "^10.1.0",
     "babel-jest": "^26.6.3",
-    "cross-fetch": "^3.0.6",
+    "cross-fetch": "^3.1.2",
     "del-cli": "^3.0.1",
-    "eslint": "^7.18.0",
-    "eslint-config-prettier": "^7.2.0",
+    "eslint": "^7.22.0",
+    "eslint-config-prettier": "^8.1.0",
     "eslint-plugin-prettier": "^3.3.1",
     "fetch-mock": "^9.11.0",
-    "husky": "^4.3.8",
+    "husky": "^5.2.0",
     "jest": "^26.6.3",
-    "lint-staged": "^10.5.3",
-    "mobx": "^6.0.5",
-    "np": "^7.2.0",
+    "lint-staged": "^10.5.4",
+    "mobx": "^6.1.8",
+    "np": "^7.4.0",
     "prettier": "^2.2.1",
-    "rollup": "^2.38.0",
+    "rollup": "^2.42.3",
     "rollup-simple-configer": "^0.1.1",
-    "ts-jest": "^26.4.4",
-    "typescript": "^4.1.3"
+    "ts-jest": "^26.5.4",
+    "typescript": "^4.2.3"
   },
   "dependencies": {
     "catch-first": "^0.3.2",
-    "custom-defaults": "^0.1.1"
+    "custom-defaults": "^0.1.2"
   }
 }
