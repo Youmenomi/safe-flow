@@ -50,9 +50,7 @@ export type SafeFlowCreator<
   TThis = any,
   TParam extends any[] = any,
   TErrf extends boolean = false
-> = (
-  ...args: TParam
-) => Promise<FlowResult<TReturn, TThis, TParam, TErrf>> &
+> = (...args: TParam) => Promise<FlowResult<TReturn, TThis, TParam, TErrf>> &
   (TErrf extends false
     ? {
         safe_flow_promise: true;
@@ -822,7 +820,7 @@ function inTree(tree: Thread, target: Thread): boolean {
   const { children } = tree;
   return children.some((child) => {
     if (child !== target) {
-      return inTree(target, child);
+      return inTree(child, target);
     } else {
       return true;
     }
@@ -943,9 +941,7 @@ function flowupProp(
   }
 }
 
-export function flowable(
-  options: FlowOptions
-): (
+export function flowable(options: FlowOptions): (
   target: any,
   propertyKey: string,
   descriptor?: PropertyDescriptor //The ? mark for ES3

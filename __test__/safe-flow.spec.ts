@@ -121,7 +121,7 @@ describe('safe-flow', () => {
         timeout(() => {
           try {
             isInvalid();
-          } catch (error) {
+          } catch (error: any) {
             input(error.message);
           }
         }, 5);
@@ -194,7 +194,7 @@ describe('safe-flow', () => {
           func();
           try {
             await flow(delay)(10);
-          } catch (error) {
+          } catch (error: any) {
             input(error.message);
             return;
           }
@@ -225,7 +225,7 @@ describe('safe-flow', () => {
           func();
           try {
             cancelSelf();
-          } catch (error) {
+          } catch (error: any) {
             input(error.message);
             return;
           }
@@ -257,7 +257,7 @@ describe('safe-flow', () => {
           func();
           try {
             cancelSelf();
-          } catch (error) {
+          } catch (error: any) {
             input(error.message);
             return;
           }
@@ -286,7 +286,7 @@ describe('safe-flow', () => {
           func();
           try {
             await flow(delay)(10);
-          } catch (error) {
+          } catch (error: any) {
             input(error.message);
             return;
           }
@@ -322,7 +322,7 @@ describe('safe-flow', () => {
           });
           func1();
           return result;
-        } catch (error) {
+        } catch (error: any) {
           input(error.name, error.message);
         }
       });
@@ -1074,7 +1074,7 @@ describe('safe-flow', () => {
       const f2 = flow(async () => {
         try {
           cancel(f1);
-        } catch (error) {
+        } catch (error: any) {
           input(error.message);
         }
       });
@@ -1965,7 +1965,7 @@ describe('safe-flow', () => {
     //@ts-expect-error
     const f1 = flow(() => undefined);
     await expect(async () => await f1()).rejects.toThrowError(
-      "Cannot read property 'then' of undefined"
+      "Cannot read properties of undefined (reading 'then')"
     );
 
     {
